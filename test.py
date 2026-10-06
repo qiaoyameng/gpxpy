@@ -3610,6 +3610,171 @@ class GPXTests(mod_unittest.TestCase):
         with self.assertRaises(mod_gpx.GPXException):
             gpx.fill_time_data_with_regular_intervals(start_time=start_time, end_time=end_time, force=False)
 
+    def test_resample_across_international_date_line(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1, tzinfo=mod_datetime.timezone.utc)
+        segment.points.append(mod_gpx.GPXTrackPoint(0.0, 179.0, 100.0, start))
+        segment.points.append(mod_gpx.GPXTrackPoint(0.0, -179.0, 200.0,
+                                                    start + mod_datetime.timedelta(minutes=2)))
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        resampled = gpx.resample(time_delta=mod_datetime.timedelta(minutes=1))
+
+        points = resampled.tracks[0].segments[0].points
+        self.assertEqual(3, len(points))
+        self.assertAlmostEqual(0.0, points[1].latitude)
+        self.assertEqual(-180.0, points[1].longitude)
+        self.assertEqual(150.0, points[1].elevation)
+
+    def test_resample_splits_segments_after_positioning_outage(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1, tzinfo=mod_datetime.timezone.utc)
+        segment.points.extend([
+            mod_gpx.GPXTrackPoint(0.0, 0.0, time=start),
+            mod_gpx.GPXTrackPoint(0.0, 1.0, time=start + mod_datetime.timedelta(seconds=10)),
+            mod_gpx.GPXTrackPoint(1.0, 0.0, time=start + mod_datetime.timedelta(seconds=100)),
+            mod_gpx.GPXTrackPoint(1.0, 1.0, time=start + mod_datetime.timedelta(seconds=110)),
+        ])
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        resampled = gpx.resample(time_delta=mod_datetime.timedelta(seconds=10),
+                                 max_time_interval=mod_datetime.timedelta(seconds=20))
+
+        self.assertEqual(2, len(resampled.tracks[0].segments))
+        self.assertEqual([0, 10],
+                         [int(total_seconds(point.time - start)) # type: ignore
+                          for point in resampled.tracks[0].segments[0].points])
+        self.assertEqual([100, 110],
+                         [int(total_seconds(point.time - start)) # type: ignore
+                          for point in resampled.tracks[0].segments[1].points])
+
+    def test_resample_does_not_join_existing_segments(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        start = mod_datetime.datetime(2020, 1, 1, tzinfo=mod_datetime.timezone.utc)
+        first_segment = mod_gpx.GPXTrackSegment([
+            mod_gpx.GPXTrackPoint(0.0, 0.0, time=start),
+            mod_gpx.GPXTrackPoint(1.0, 0.0, time=start + mod_datetime.timedelta(seconds=10)),
+        ])
+        second_segment = mod_gpx.GPXTrackSegment([
+            mod_gpx.GPXTrackPoint(2.0, 0.0, time=start + mod_datetime.timedelta(seconds=10)),
+            mod_gpx.GPXTrackPoint(3.0, 0.0, time=start + mod_datetime.timedelta(seconds=20)),
+        ])
+        track.segments.extend([first_segment, second_segment])
+        gpx.tracks.append(track)
+
+        resampled = gpx.resample(time_delta=mod_datetime.timedelta(seconds=10))
+
+        self.assertEqual(2, len(resampled.tracks[0].segments))
+        self.assertEqual([[0.0, 1.0], [2.0, 3.0]],
+                         [[point.latitude for point in segment.points]
+                          for segment in resampled.tracks[0].segments])
+
+    def test_resample_repeated_and_naive_times(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1)
+        segment.points.extend([
+            mod_gpx.GPXTrackPoint(0.0, 0.0, time=start),
+            mod_gpx.GPXTrackPoint(0.0, 0.0, time=start),
+            mod_gpx.GPXTrackPoint(10.0, 0.0, time=start + mod_datetime.timedelta(seconds=60)),
+        ])
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        resampled = gpx.resample(time_delta=mod_datetime.timedelta(seconds=30))
+
+        points = resampled.tracks[0].segments[0].points
+        self.assertEqual([0.0, 5.0, 10.0], [point.latitude for point in points])
+        self.assertEqual([0, 30, 60],
+                         [int(total_seconds(point.time - start.replace(tzinfo=mod_datetime.timezone.utc))) # type: ignore
+                          for point in points])
+        self.assertTrue(all(point.time.tzinfo is not None for point in points))
+        self.assertEqual(3, len(gpx.tracks[0].segments[0].points))
+        self.assertIsNone(gpx.tracks[0].segments[0].points[0].time.tzinfo)
+
+    def test_resample_preserves_missing_elevation_as_none(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1, tzinfo=mod_datetime.timezone.utc)
+        segment.points.extend([
+            mod_gpx.GPXTrackPoint(0.0, 0.0, 100.0, start),
+            mod_gpx.GPXTrackPoint(5.0, 0.0, None, start + mod_datetime.timedelta(seconds=60)),
+            mod_gpx.GPXTrackPoint(10.0, 0.0, 200.0, start + mod_datetime.timedelta(seconds=120)),
+        ])
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        resampled = gpx.resample(time_delta=mod_datetime.timedelta(seconds=30))
+
+        self.assertEqual([100.0, None, None, None, 200.0],
+                         [point.elevation for point in resampled.tracks[0].segments[0].points])
+
+    def test_resample_with_explicit_start_time(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1, 0, 0, 10,
+                                      tzinfo=mod_datetime.timezone.utc)
+        segment.points.extend([
+            mod_gpx.GPXTrackPoint(0.0, 0.0, time=start),
+            mod_gpx.GPXTrackPoint(60.0, 0.0, time=start + mod_datetime.timedelta(seconds=60)),
+        ])
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        resampled = gpx.resample(
+            time_delta=mod_datetime.timedelta(seconds=20),
+            start_time=mod_datetime.datetime(2020, 1, 1, tzinfo=mod_datetime.timezone.utc))
+
+        self.assertEqual([10, 30, 50],
+                         [int(total_seconds(point.time - start)) # type: ignore
+                          for point in resampled.tracks[0].segments[0].points])
+
+    def test_resample_handles_near_antipodal_points(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1, tzinfo=mod_datetime.timezone.utc)
+        segment.points.extend([
+            mod_gpx.GPXTrackPoint(0.0, 0.0, time=start),
+            mod_gpx.GPXTrackPoint(0.0, 179.999999,
+                                  time=start + mod_datetime.timedelta(seconds=60)),
+        ])
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        points = gpx.resample(time_delta=mod_datetime.timedelta(seconds=30)).tracks[0].segments[0].points
+
+        self.assertAlmostEqual(90.0, points[1].longitude, places=5)
+
+        segment.points[-1].longitude = 180.0
+        with self.assertRaises(mod_gpx.GPXException):
+            gpx.resample(time_delta=mod_datetime.timedelta(seconds=30))
+
+    def test_resample_rejects_reverse_time(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1, tzinfo=mod_datetime.timezone.utc)
+        segment.points.extend([
+            mod_gpx.GPXTrackPoint(0.0, 0.0, time=start),
+            mod_gpx.GPXTrackPoint(1.0, 0.0, time=start - mod_datetime.timedelta(seconds=1)),
+        ])
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+
+        with self.assertRaises(mod_gpx.GPXException):
+            gpx.resample(time_delta=mod_datetime.timedelta(seconds=30))
+
     def test_single_quotes_xmlns(self) -> None:
         gpx = mod_gpxpy.parse("""<?xml version='1.0' encoding='UTF-8'?>
 <gpx version='1.1' creator='GPSMID' xmlns='http://www.topografix.com/GPX/1/1'>

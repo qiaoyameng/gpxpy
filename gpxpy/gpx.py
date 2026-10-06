@@ -49,6 +49,8 @@ SMOOTHING_RATIO = (0.4, 0.2, 0.4)
 # if speed is less than this value -- we'll assume it is zero
 DEFAULT_STOPPED_SPEED_THRESHOLD = 1
 
+UTC = mod_datetime.timezone.utc
+
 # Fields used for all point elements (route point, track point, waypoint):
 GPX_10_POINT_FIELDS = [
         mod_gpxfield.GPXField('latitude', attribute='lat', type=mod_gpxfield.FLOAT_TYPE, mandatory=True),
@@ -138,6 +140,12 @@ class PointData(NamedTuple):
     track_no: int
     segment_no: int
     point_no: int
+
+
+def _ensure_utc(time: mod_datetime.datetime) -> mod_datetime.datetime:
+    if time.tzinfo is None:
+        return time.replace(tzinfo=UTC)
+    return time.astimezone(UTC)
 
 
 class GPXException(Exception):
@@ -1376,6 +1384,105 @@ class GPXTrackSegment:
 
         return len(self.points) > 2 and found / len(self.points) > .75
 
+    def resample(self, time_delta: mod_datetime.timedelta,
+                 start_time: Optional[mod_datetime.datetime] = None,
+                 max_time_interval: Optional[mod_datetime.timedelta] = None) -> List["GPXTrackSegment"]:
+        """
+        Return track segments containing points on a fixed time grid.
+
+        Positions are interpolated on the shorter great-circle arc. Elevation
+        is linearly interpolated only when both surrounding points contain
+        elevation. Adjacent points separated by more than
+        ``max_time_interval`` become separate segments; points from different
+        existing segments are never joined.
+
+        Repeated timestamps resolve to the last point at that time, points
+        without time are ignored, and times without timezone information are
+        interpreted as UTC.
+        """
+        if time_delta <= mod_datetime.timedelta(0):
+            raise GPXException('time_delta must be positive')
+        if max_time_interval is not None and max_time_interval <= mod_datetime.timedelta(0):
+            raise GPXException('max_time_interval must be positive')
+
+        timed_points: List[Tuple[mod_datetime.datetime, GPXTrackPoint]] = []
+        previous_time: Optional[mod_datetime.datetime] = None
+        for point in self.points:
+            if point.time is None:
+                continue
+            point_time = _ensure_utc(point.time)
+            if previous_time is not None and point_time < previous_time:
+                raise GPXException('Cannot resample a segment containing times in reverse order')
+            if previous_time is not None and point_time == previous_time:
+                timed_points[-1] = (point_time, point)
+            else:
+                timed_points.append((point_time, point))
+            previous_time = point_time
+
+        if not timed_points:
+            return [GPXTrackSegment()]
+
+        if start_time is None:
+            grid_start = timed_points[0][0]
+        else:
+            grid_start = _ensure_utc(start_time)
+
+        groups: List[List[Tuple[mod_datetime.datetime, GPXTrackPoint]]] = [[]]
+        previous_group_time: Optional[mod_datetime.datetime] = None
+        for timed_point in timed_points:
+            point_time = timed_point[0]
+            if (max_time_interval is not None and previous_group_time is not None
+                    and point_time - previous_group_time > max_time_interval):
+                groups.append([])
+            groups[-1].append(timed_point)
+            previous_group_time = point_time
+
+        resampled_segments: List[GPXTrackSegment] = []
+        for group in groups:
+            resampled_points: List[GPXTrackPoint] = []
+            group_start = group[0][0]
+            group_end = group[-1][0]
+
+            sample_time = grid_start
+            point_no = 0
+            while sample_time <= group_end:
+                if sample_time >= group_start:
+                    while point_no + 1 < len(group) and group[point_no + 1][0] <= sample_time:
+                        point_no += 1
+
+                    source_time, source_point = group[point_no]
+                    if sample_time == source_time:
+                        resampled_point = mod_copy.deepcopy(source_point)
+                        resampled_point.time = sample_time
+                    else:
+                        next_time, next_point = group[point_no + 1]
+                        ratio = mod_utils.total_seconds(sample_time - source_time) \
+                            / mod_utils.total_seconds(next_time - source_time)
+                        try:
+                            latitude, longitude = mod_geo.great_circle_interpolate(
+                                source_point.latitude, source_point.longitude,
+                                next_point.latitude, next_point.longitude, ratio)
+                        except ValueError as error:
+                            raise GPXException(str(error)) from error
+
+                        elevation: Optional[float] = None
+                        if source_point.elevation is not None and next_point.elevation is not None:
+                            elevation = source_point.elevation \
+                                + (next_point.elevation - source_point.elevation) * ratio
+                        resampled_point = GPXTrackPoint(latitude, longitude, elevation, sample_time)
+
+                    resampled_points.append(resampled_point)
+
+                if sample_time == group_end:
+                    break
+                sample_time += time_delta
+                if sample_time > group_end:
+                    break
+
+            if resampled_points:
+                resampled_segments.append(GPXTrackSegment(resampled_points))
+
+        return resampled_segments
 
     def __repr__(self) -> str:
         return f'GPXTrackSegment(points=[{"..." if self.points else ""}])'
@@ -1902,7 +2009,20 @@ class GPXTrack:
         return min((NearestLocationData(pt, -1, seg, pt_no) for (pt, seg, pt_no) in self.walk()) # type: ignore
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
-        
+
+    def resample(self, time_delta: mod_datetime.timedelta,
+                 start_time: Optional[mod_datetime.datetime] = None,
+                 max_time_interval: Optional[mod_datetime.timedelta] = None) -> "GPXTrack":
+        """ Return a copy of this track with its segments resampled. """
+        resampled_track = mod_copy.deepcopy(self)
+        resampled_track.segments = []
+        for segment in self.segments:
+            resampled_track.segments.extend(
+                segment.resample(time_delta=time_delta,
+                                 start_time=start_time,
+                                 max_time_interval=max_time_interval))
+        return resampled_track
+
     def clone(self) -> "GPXTrack":
         return mod_copy.deepcopy(self)
 
@@ -2055,6 +2175,35 @@ class GPX:
 
         # TODO
         log.debug('Track reduced to %s points', self.get_track_points_no())
+
+    def resample(self, time_delta: mod_datetime.timedelta,
+                 start_time: Optional[mod_datetime.datetime] = None,
+                 max_time_interval: Optional[mod_datetime.timedelta] = None) -> "GPX":
+        """
+        Return a new GPX object whose tracks use a fixed sampling interval.
+
+        Waypoints, routes and metadata are copied unchanged. When no explicit
+        ``start_time`` is supplied, the common grid starts at the earliest
+        timed track point. Times without timezone information are interpreted
+        as UTC.
+        """
+        resampled_gpx = mod_copy.deepcopy(self)
+        if start_time is None:
+            bounds_start, _ = self.get_time_bounds()
+            if bounds_start is None:
+                raise GPXException('Cannot resample without timed track points or an explicit start_time')
+            grid_start: Optional[mod_datetime.datetime] = bounds_start
+        else:
+            grid_start = start_time
+
+        resampled_gpx.tracks = [
+            track.resample(time_delta=time_delta,
+                           start_time=grid_start,
+                           max_time_interval=max_time_interval)
+            for track in self.tracks
+        ]
+        resampled_gpx.refresh_bounds()
+        return resampled_gpx
 
     def adjust_time(self, delta: mod_datetime.timedelta, all: bool=False) -> None:
         """

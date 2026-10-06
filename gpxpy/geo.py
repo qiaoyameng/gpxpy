@@ -28,6 +28,9 @@ EARTH_RADIUS = 6378.137 * 1000
 # One degree in meters:
 ONE_DEGREE = (2*mod_math.pi*EARTH_RADIUS) / 360  # ==> 111.319 km
 
+ANTIPODAL_EPSILON: float = 1e-10
+FLOAT_EPSILON: float = 2.220446049250313e-16
+
 HAVERSINE_THRESHOLD: float = .1
 """
 Threshold for switching from equirectangular to haversine distance in ``distance()``
@@ -38,6 +41,79 @@ the equirectangular approximation is used.
 This is a public, user-tunable knob. Assigning a new value to it changes the behavior
 of :func:`distance` for the entire process.
 """
+
+def great_circle_interpolate(latitude_1: float, longitude_1: float,
+                             latitude_2: float, longitude_2: float,
+                             ratio: float) -> Tuple[float, float]:
+    """
+    Interpolate between two coordinates on the shorter great-circle arc.
+
+    Longitudes are intentionally not averaged, so paths crossing the 180th
+    meridian remain on the short arc. Coordinates exactly at the antipode do
+    not determine a unique great-circle arc.
+    """
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f'Interpolation ratio must be between 0 and 1: {ratio}')
+    if ratio == 0.0:
+        return latitude_1, longitude_1
+    if ratio == 1.0:
+        return latitude_2, longitude_2
+
+    lat1 = mod_math.radians(latitude_1)
+    lon1 = mod_math.radians(longitude_1)
+    lat2 = mod_math.radians(latitude_2)
+    lon2 = mod_math.radians(longitude_2)
+
+    cos_lat1 = mod_math.cos(lat1)
+    cos_lat2 = mod_math.cos(lat2)
+    vector_1 = (
+        cos_lat1 * mod_math.cos(lon1),
+        cos_lat1 * mod_math.sin(lon1),
+        mod_math.sin(lat1),
+    )
+    vector_2 = (
+        cos_lat2 * mod_math.cos(lon2),
+        cos_lat2 * mod_math.sin(lon2),
+        mod_math.sin(lat2),
+    )
+
+    dot = max(-1.0, min(1.0, vector_1[0] * vector_2[0] + vector_1[1] * vector_2[1]
+                         + vector_1[2] * vector_2[2]))
+    omega = mod_math.acos(dot)
+
+    if omega < FLOAT_EPSILON:
+        interpolated = (
+            (1.0 - ratio) * vector_1[0] + ratio * vector_2[0],
+            (1.0 - ratio) * vector_1[1] + ratio * vector_2[1],
+            (1.0 - ratio) * vector_1[2] + ratio * vector_2[2],
+        )
+    else:
+        if mod_math.pi - omega < ANTIPODAL_EPSILON:
+            raise ValueError('Cannot interpolate between antipodal or nearly antipodal points')
+
+        sin_omega = mod_math.sin(omega)
+        scale_1 = mod_math.sin((1.0 - ratio) * omega) / sin_omega
+        scale_2 = mod_math.sin(ratio * omega) / sin_omega
+        interpolated = (
+            scale_1 * vector_1[0] + scale_2 * vector_2[0],
+            scale_1 * vector_1[1] + scale_2 * vector_2[1],
+            scale_1 * vector_1[2] + scale_2 * vector_2[2],
+        )
+
+    vector_length = mod_math.sqrt(
+        interpolated[0] * interpolated[0]
+        + interpolated[1] * interpolated[1]
+        + interpolated[2] * interpolated[2])
+    x, y, z = (
+        interpolated[0] / vector_length,
+        interpolated[1] / vector_length,
+        interpolated[2] / vector_length,
+    )
+    latitude = mod_math.degrees(mod_math.asin(max(-1.0, min(1.0, z))))
+    longitude = mod_math.degrees(mod_math.atan2(y, x))
+    longitude = (longitude + 180.0) % 360.0 - 180.0
+
+    return latitude, longitude
 
 def haversine_distance(latitude_1: float, longitude_1: float, latitude_2: float, longitude_2: float) -> float:
     """
