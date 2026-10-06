@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.calibrate as mod_calibrate
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3705,6 +3706,121 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    # --- Time calibration (gpxpy.calibrate) ------------------------------
+
+    def __build_calibration_route(self, legs: List[Tuple[float, float, float]]) -> mod_gpx.GPX:
+        """ Synthetic 1 Hz track; legs are (duration_s, speed_mps, heading_deg). """
+        base = mod_datetime.datetime(2020, 1, 1, 12, 0, 0)
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        segment = mod_gpx.GPXTrackSegment()
+        track.segments.append(segment)
+        latitude, longitude = 46.0, 15.0
+        seconds = 0.0
+        segment.points.append(mod_gpx.GPXTrackPoint(latitude, longitude, time=base))
+        for duration, speed, heading in legs:
+            for _ in range(int(duration)):
+                seconds += 1
+                if speed > 0:
+                    latitude, longitude = mod_geo.LocationDelta(
+                            distance=speed, angle=heading).move(mod_geo.Location(latitude, longitude))
+                segment.points.append(mod_gpx.GPXTrackPoint(
+                        latitude, longitude, time=base + mod_datetime.timedelta(seconds=seconds)))
+        return gpx
+
+    def __inject_clock_error(self, gpx: mod_gpx.GPX, offset: float, drift: float) -> mod_gpx.GPX:
+        """ Copy of `gpx` whose clock is slow by `offset` s with relative `drift`. """
+        base = mod_datetime.datetime(2020, 1, 1, 12, 0, 0)
+        result = mod_copy.deepcopy(gpx)
+        for point in result.tracks[0].segments[0].points:
+            seconds = (point.time - base).total_seconds()  # type: ignore
+            point.time = base + mod_datetime.timedelta(seconds=(seconds - offset) / (1 + drift))
+        return result
+
+    def __calibration_legs(self) -> List[Tuple[float, float, float]]:
+        # A short route with several turns and stops:
+        return [(120, 4.0, 0), (60, 0, 0), (150, 5.0, 90), (45, 0, 0),
+                (100, 4.5, 180), (30, 0, 0), (120, 5.0, 270)]
+
+    def test_time_calibration_recovers_offset_and_drift(self) -> None:
+        true_offset, true_drift = 47.0, 0.008
+        reference = self.__build_calibration_route(self.__calibration_legs())
+        target = self.__inject_clock_error(reference, true_offset, true_drift)
+        target_points = target.tracks[0].segments[0].points
+        # One localisation outlier must not ruin the estimate:
+        target_points[300].latitude += 0.003
+        # Extensions must survive calibration:
+        target_points[10].extensions.append(mod_etree.Element('test_extension'))
+
+        result = mod_calibrate.calibrate(reference, target,
+                offset_range=(0, 120), drift_range=(-0.02, 0.02), min_overlap=60)
+
+        self.assertFalse(result.uncertain, msg=result.reason)
+        self.assertIsNotNone(result.corrected)
+        corrected_points = result.corrected.tracks[0].segments[0].points  # type: ignore
+        reference_points = reference.tracks[0].segments[0].points
+        # Recovered transform must map target times onto reference times:
+        max_time_error = max(abs((c.time - r.time).total_seconds())  # type: ignore
+                for c, r in zip(corrected_points, reference_points))
+        self.assertTrue(max_time_error < 1.0, msg=f'max time error {max_time_error}')
+        self.assertAlmostEqual(true_drift, result.drift, delta=5e-4)  # type: ignore
+        # Only timestamps may change, not locations or extensions:
+        for corrected, original in zip(corrected_points, target_points):
+            self.assertEqual(original.latitude, corrected.latitude)
+            self.assertEqual(original.longitude, corrected.longitude)
+        self.assertEqual(1, len(corrected_points[10].extensions))
+        self.assertEqual('test_extension', corrected_points[10].extensions[0].tag)
+        # The input target must be left untouched:
+        self.assertNotEqual(reference_points[100].time, target_points[100].time)
+
+    def test_time_calibration_stationary_is_uncertain(self) -> None:
+        reference = self.__build_calibration_route([(600, 0, 0)])
+        target = self.__inject_clock_error(reference, 30.0, 0.0)
+        result = mod_calibrate.calibrate(reference, target,
+                offset_range=(0, 120), drift_range=(-0.02, 0.02), min_overlap=60)
+        self.assertTrue(result.uncertain)
+        self.assertIsNone(result.corrected)
+        self.assertIn('stationary', result.reason)
+
+    def test_time_calibration_short_overlap_is_uncertain(self) -> None:
+        # A turn inside the first 40 s makes the alignment unique, but the
+        # 40 s overlap is still too short to trust:
+        legs = [(20, 4.0, 0), (20, 4.0, 90)] + self.__calibration_legs()
+        reference = self.__build_calibration_route(legs)
+        target = self.__inject_clock_error(reference, 30.0, 0.0)
+        target.tracks[0].segments[0].points = target.tracks[0].segments[0].points[:41]
+        result = mod_calibrate.calibrate(reference, target,
+                offset_range=(0, 120), drift_range=(-0.02, 0.02), min_overlap=60)
+        self.assertTrue(result.uncertain)
+        self.assertIsNone(result.corrected)
+        self.assertIn('overlap', result.reason)
+
+    def test_time_calibration_repeated_laps_are_uncertain(self) -> None:
+        # Identical laps: shifting by a whole lap is a near-equivalent solution:
+        lap = [(25, 4.0, 0), (25, 4.0, 90), (25, 4.0, 180), (25, 4.0, 270)]
+        reference = self.__build_calibration_route(lap * 5)
+        target = self.__inject_clock_error(reference, 30.0, 0.0)
+        result = mod_calibrate.calibrate(reference, target,
+                offset_range=(-80, 120), drift_range=(-0.02, 0.02), min_overlap=60)
+        self.assertTrue(result.uncertain)
+        self.assertIsNone(result.corrected)
+        self.assertIn('near-equivalent', result.reason)
+
+    def test_time_calibration_no_interpolation_across_gaps(self) -> None:
+        reference = self.__build_calibration_route(self.__calibration_legs())
+        points = reference.tracks[0].segments[0].points
+        # Simulate a recording interruption inside a single segment:
+        gap_start = points[200].time
+        for point in points[201:]:
+            point.time = point.time + mod_datetime.timedelta(seconds=300)  # type: ignore
+        runs = mod_calibrate._extract_runs(reference, gap_threshold=30.0)  # type: ignore
+        self.assertEqual(2, len(runs))
+        gap_middle = (gap_start + mod_datetime.timedelta(seconds=150)  # type: ignore
+                - mod_datetime.datetime(1970, 1, 1)).total_seconds()
+        position, _ = mod_calibrate._interpolate(runs, gap_middle, 0)
+        self.assertIsNone(position)
 
 if __name__ == '__main__':
     mod_unittest.main()

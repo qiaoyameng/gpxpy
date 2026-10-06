@@ -89,6 +89,31 @@ Gpxpy is a GPX parser and by using it you have access to all the data from the o
 
     moving_data = gpx.get_moving_data(raw=True)
 
+## Time calibration between two recordings
+
+When the same activity is recorded with two devices and one clock is off (a
+constant offset and/or a steady drift), `gpxpy.calibrate.calibrate()`
+estimates the linear time transform between the two tracks and returns a
+corrected copy of the target GPX in which only timestamps are changed:
+
+    import gpxpy, gpxpy.calibrate
+
+    reference = gpxpy.parse(open('reference.gpx'))
+    target = gpxpy.parse(open('target.gpx'))
+    result = gpxpy.calibrate.calibrate(reference, target,
+                                       offset_range=(-120, 120),
+                                       drift_range=(-0.02, 0.02))
+    if result.uncertain:
+        print('cannot calibrate:', result.reason)
+    else:
+        corrected_xml = result.corrected.to_xml()
+
+The corrected time of each point is `time + offset + drift * (time -
+time_origin)`. If the tracks don't move enough, overlap too little in
+time, or several near-equivalent solutions exist (e.g. repeated identical
+laps), the result is flagged as `uncertain` instead of reporting a
+deceptively precise transform.
+
 ## Pull requests
 
 Branches:
@@ -119,4 +144,3 @@ pip install gpx-cmd-tools
 ## License
 
 GPX.py is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
-
