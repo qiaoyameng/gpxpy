@@ -139,6 +139,29 @@ class PointData(NamedTuple):
     segment_no: int
     point_no: int
 
+class StayPoint(NamedTuple):
+    """
+    A maximal run of track points that stay within a spatial radius for at
+    least a minimum duration, without any sampling gap larger than a maximum
+    observation interval.
+
+    The representative ``center`` is the mean latitude/longitude of all the
+    points in the run; every point in the run is within ``radius`` meters of
+    that center. The index fields are -1 at aggregation levels that do not
+    identify the corresponding object (for example, ``track_no`` is -1 for
+    stay points returned by a segment).
+    """
+    start_point: "GPXTrackPoint"
+    end_point: "GPXTrackPoint"
+    start_time: mod_datetime.datetime
+    end_time: mod_datetime.datetime
+    duration: float
+    center: mod_geo.Location
+    track_no: int
+    segment_no: int
+    start_point_no: int
+    end_point_no: int
+
 
 class GPXException(Exception):
     """
@@ -1225,6 +1248,138 @@ class GPXTrackSegment:
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
 
+    def get_stay_points(self, radius: float, min_duration: float, max_gap: Optional[float]=None) -> List[StayPoint]:
+        """
+        Detect stay points (stops) in this segment.
+
+        A stay point is a maximal run of consecutive points that:
+
+        - have both a time and a location,
+        - stay at least ``min_duration`` seconds long (time from the first to
+          the last point in the run),
+        - have no gap between two consecutive observations larger than
+          ``max_gap`` seconds (if provided), and
+        - are all within ``radius`` meters of the run's representative center
+          (the mean latitude/longitude of the run's points).
+
+        The spatial condition is evaluated against the whole run, not between
+        adjacent points: a trajectory that moves slowly but ends up far away
+        from the center is not reported as a stay.
+
+        Points without a time or without a numeric location break the
+        evidence: they are never included in a stay and the points around
+        them cannot be joined into one stay. The segment boundary itself is a
+        break -- stays never span multiple segments.
+
+        Parameters
+        ----------
+        radius : float
+            Maximum distance in meters from any point of the run to its
+            representative center.
+        min_duration : float
+            Minimum duration in seconds for a run to count as a stay.
+        max_gap : float, optional
+            Maximum allowed time in seconds between two consecutive
+            observations of a run. Larger gaps split the evidence into
+            separate stays. If None, gaps are not checked.
+
+        Returns
+        ----------
+        stay_points : list[StayPoint]
+            Stays detected in this segment, ordered by time.
+        """
+
+        def valid(point: GPXTrackPoint) -> bool:
+            def has_coordinate(value: Any) -> bool:
+                return mod_utils.is_numeric(value) and not mod_math.isnan(float(value))
+
+            return point.time is not None \
+                and has_coordinate(point.latitude) \
+                and has_coordinate(point.longitude)
+
+        stay_points: List[StayPoint] = []
+
+        start_no = 0
+        point_count = len(self.points)
+        while start_no < point_count:
+            if not valid(self.points[start_no]):
+                # Points without time/location (and segment ends) break the
+                # evidence, skip them and restart after the break.
+                start_no += 1
+                continue
+
+            end_no = start_no
+            latitude_sum = self.points[start_no].latitude
+            longitude_sum = self.points[start_no].longitude
+            for candidate_no in range(start_no + 1, point_count):
+                candidate = self.points[candidate_no]
+
+                if not valid(candidate):
+                    break
+
+                # A large sampling gap must interrupt the evidence:
+                if max_gap is not None:
+                    last_time = self.points[end_no].time
+                    if last_time is None:
+                        break
+                    gap = abs((candidate.time - last_time).total_seconds())
+                    if gap > max_gap:
+                        break
+
+                # Check the *whole* candidate run against a single
+                # representative center. The run stays valid only while its
+                # growing mean keeps every accumulated point within radius,
+                # so slow movement that accumulates beyond the radius breaks
+                # the stay instead of being accepted pair by pair.
+                run_size = candidate_no - start_no + 1
+                center_latitude = (latitude_sum + candidate.latitude) / run_size
+                center_longitude = (longitude_sum + candidate.longitude) / run_size
+                center = mod_geo.Location(center_latitude, center_longitude)
+
+                within_radius = True
+                for point_no in range(start_no, candidate_no + 1):
+                    point = self.points[point_no]
+                    distance = point.distance_2d(center)
+                    if distance is None or distance > radius:
+                        within_radius = False
+                        break
+
+                if not within_radius:
+                    break
+
+                end_no = candidate_no
+                latitude_sum += candidate.latitude
+                longitude_sum += candidate.longitude
+
+            start_point = self.points[start_no]
+            end_point = self.points[end_no]
+            if start_point.time is None or end_point.time is None:
+                start_no += 1
+                continue
+            duration = abs((end_point.time - start_point.time).total_seconds())
+            if duration >= min_duration:
+                run_size = end_no - start_no + 1
+                center_latitude = latitude_sum / run_size
+                center_longitude = longitude_sum / run_size
+                stay_points.append(StayPoint(
+                        start_point,
+                        end_point,
+                        start_point.time,
+                        end_point.time,
+                        duration,
+                        mod_geo.Location(center_latitude, center_longitude),
+                        -1,
+                        -1,
+                        start_no,
+                        end_no))
+                # Continue after the end; the last point is allowed to start
+                # the next stay as its first observation.
+                start_no = end_no + 1
+            else:
+                start_no += 1
+
+        return stay_points
+
     def smooth(self, vertical: bool=True, horizontal: bool=False, remove_extremes: bool=False) -> None:
         """ "Smooths" the elevation graph. Can be called multiple times. """
         if len(self.points) <= 3:
@@ -1902,6 +2057,26 @@ class GPXTrack:
         return min((NearestLocationData(pt, -1, seg, pt_no) for (pt, seg, pt_no) in self.walk()) # type: ignore
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
+
+    def get_stay_points(self, radius: float, min_duration: float, max_gap: Optional[float]=None) -> List[StayPoint]:
+        """
+        Detect stay points (stops) in this track.
+
+        Each segment is searched independently; stays never span segment
+        boundaries. See GPXTrackSegment.get_stay_points() for the meaning of
+        the parameters and the detection rules.
+
+        Returns
+        ----------
+        stay_points : list[StayPoint]
+            Stays detected in all segments, ordered by segment and time.
+            ``track_no`` is -1, ``segment_no`` identifies the segment.
+        """
+        stay_points: List[StayPoint] = []
+        for segment_no, segment in enumerate(self.segments):
+            for stay_point in segment.get_stay_points(radius, min_duration, max_gap):
+                stay_points.append(stay_point._replace(segment_no=segment_no))
+        return stay_points
         
     def clone(self) -> "GPXTrack":
         return mod_copy.deepcopy(self)
@@ -2518,6 +2693,26 @@ class GPX:
         return min((NearestLocationData(pt, tr, seg, pt_no) for (pt,tr, seg, pt_no) in self.walk()) # type:ignore
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
+
+    def get_stay_points(self, radius: float, min_duration: float, max_gap: Optional[float]=None) -> List[StayPoint]:
+        """
+        Detect stay points (stops) in all tracks of this GPX.
+
+        Each segment is searched independently; stays never span segment or
+        track boundaries. See GPXTrackSegment.get_stay_points() for the
+        meaning of the parameters and the detection rules.
+
+        Returns
+        ----------
+        stay_points : list[StayPoint]
+            Stays detected in all tracks and segments, ordered by track,
+            segment and time.
+        """
+        stay_points: List[StayPoint] = []
+        for track_no, track in enumerate(self.tracks):
+            for stay_point in track.get_stay_points(radius, min_duration, max_gap):
+                stay_points.append(stay_point._replace(track_no=track_no))
+        return stay_points
 
     def add_elevation(self, delta: float) -> None:
         """

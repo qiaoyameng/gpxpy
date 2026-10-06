@@ -3706,5 +3706,181 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
 
+    def _jittered_parking_points(self, interval_seconds: int, parked_seconds: int,
+                                 jitter_meters: float=8.) -> List[mod_gpx.GPXTrackPoint]:
+        """
+        Jittery parking at one spot followed by a point clearly away from it.
+        """
+        base_latitude = 45.0
+        base_longitude = 15.0
+        rng = mod_random.Random(1234)
+
+        points: List[mod_gpx.GPXTrackPoint] = []
+        time = mod_datetime.datetime(2024, 5, 1, 12, 0, 0)
+        number_of_parked_points = parked_seconds // interval_seconds + 2
+        for _ in range(number_of_parked_points):
+            d_latitude = (rng.random() * 2 - 1) * jitter_meters / 111320.
+            d_longitude = (rng.random() * 2 - 1) * jitter_meters \
+                    / (111320. * mod_math.cos(mod_math.radians(base_latitude)))
+            points.append(mod_gpx.GPXTrackPoint(
+                    latitude=base_latitude + d_latitude,
+                    longitude=base_longitude + d_longitude,
+                    time=time))
+            time += mod_datetime.timedelta(seconds=interval_seconds)
+
+        # The point that proves the track drove away from the parking spot:
+        points.append(mod_gpx.GPXTrackPoint(
+                latitude=base_latitude + 0.01,
+                longitude=base_longitude,
+                time=time))
+
+        return points
+
+    def test_stay_points_dense_and_sparse_sampling_agree(self) -> None:
+        radius = 50.
+        min_duration = 600.
+
+        dense_segment = mod_gpx.GPXTrackSegment(self._jittered_parking_points(10, 600))
+        sparse_segment = mod_gpx.GPXTrackSegment(self._jittered_parking_points(120, 600))
+
+        dense_stays = dense_segment.get_stay_points(radius, min_duration, max_gap=300.)
+        sparse_stays = sparse_segment.get_stay_points(radius, min_duration, max_gap=300.)
+
+        self.assertEqual(1, len(dense_stays))
+        self.assertEqual(1, len(sparse_stays))
+
+        dense = dense_stays[0]
+        sparse = sparse_stays[0]
+
+        # The driving-away point must not be part of either stay:
+        self.assertEqual(len(dense_segment.points) - 1, dense.end_point_no + 1)
+        self.assertEqual(len(sparse_segment.points) - 1, sparse.end_point_no + 1)
+
+        # Same physical parking spot: both centers must be close to each
+        # other and to the true spot within the jitter radius:
+        parking_spot = mod_geo.Location(45., 15.)
+        self.assertLess(dense.center.distance_2d(sparse.center), radius)
+        self.assertLess(dense.center.distance_2d(parking_spot), radius)
+        self.assertLess(sparse.center.distance_2d(parking_spot), radius)
+
+        # Time intervals agree within one (sparse) sampling interval:
+        start_time_diff = (dense.start_time - sparse.start_time).total_seconds()
+        self.assertAlmostEqual(0., start_time_diff, delta=120.)
+        self.assertAlmostEqual(600., (sparse.end_time - sparse.start_time).total_seconds(), delta=120.)
+        self.assertAlmostEqual(600., (dense.end_time - dense.start_time).total_seconds(), delta=10.)
+
+        # Start/end point references point at the original trajectory:
+        self.assertIs(dense_segment.points[dense.start_point_no], dense.start_point)
+        self.assertIs(dense_segment.points[dense.end_point_no], dense.end_point)
+
+        # Every point of the run is within the radius of the center:
+        for point_no in range(dense.start_point_no, dense.end_point_no + 1):
+            self.assertLessEqual(dense_segment.points[point_no].distance_2d(dense.center), radius)
+
+        # Segment-level results do not identify a track/segment:
+        self.assertEqual(-1, dense.track_no)
+        self.assertEqual(-1, dense.segment_no)
+
+    def test_stay_points_large_gap_interrupts_evidence(self) -> None:
+        # Two long groups of observations at the exact same spot separated
+        # by a large sampling gap:
+        t0 = mod_datetime.datetime(2024, 5, 1, 12, 0, 0)
+        points = [mod_gpx.GPXTrackPoint(45., 15., time=t0 + mod_datetime.timedelta(seconds=30 * i))
+                  for i in range(11)]
+        gap_start = t0 + mod_datetime.timedelta(seconds=30 * 10 + 1800)
+        points += [mod_gpx.GPXTrackPoint(45., 15., time=gap_start + mod_datetime.timedelta(seconds=30 * i))
+                   for i in range(11)]
+        segment = mod_gpx.GPXTrackSegment(points)
+
+        stays = segment.get_stay_points(radius=50., min_duration=300., max_gap=120.)
+
+        # The gap breaks the single stop into two stays:
+        self.assertEqual(2, len(stays))
+        self.assertEqual(0, stays[0].start_point_no)
+        self.assertEqual(10, stays[0].end_point_no)
+        self.assertEqual(11, stays[1].start_point_no)
+        self.assertEqual(21, stays[1].end_point_no)
+
+        for stay in stays:
+            self.assertGreaterEqual(stay.duration, 300. - 1e-9)
+
+        # Without max_gap the gap is ignored and the stop is one stay again:
+        self.assertEqual(1, len(segment.get_stay_points(50., 300.)))
+
+    def test_stay_points_slow_walk_outside_radius_not_detected(self) -> None:
+        # Short steps (1 m) well within any adjacent-point threshold, but the
+        # trajectory accumulates 180 m over 30 minutes and leaves the radius:
+        points: List[mod_gpx.GPXTrackPoint] = []
+        time = mod_datetime.datetime(2024, 5, 1, 12, 0, 0)
+        for step in range(181):
+            points.append(mod_gpx.GPXTrackPoint(
+                    latitude=45. + step * 1. / 111320.,
+                    longitude=15.,
+                    time=time))
+            time += mod_datetime.timedelta(seconds=10)
+
+        segment = mod_gpx.GPXTrackSegment(points)
+        stays = segment.get_stay_points(radius=10., min_duration=600., max_gap=60.)
+
+        self.assertEqual([], stays)
+
+    def test_stay_points_points_without_time_break_evidence(self) -> None:
+        t0 = mod_datetime.datetime(2024, 5, 1, 12, 0, 0)
+        points = [
+            mod_gpx.GPXTrackPoint(45., 15., time=t0),
+            mod_gpx.GPXTrackPoint(45.00001, 15., time=None),
+            mod_gpx.GPXTrackPoint(45., 15., time=t0 + mod_datetime.timedelta(seconds=900)),
+        ]
+
+        segment = mod_gpx.GPXTrackSegment(points)
+        # The two valid observations are 15 minutes apart but cannot be
+        # joined because the point without a time breaks the evidence:
+        self.assertEqual([], segment.get_stay_points(50., 600.))
+
+    def test_stay_points_missing_location_breaks_evidence(self) -> None:
+        t0 = mod_datetime.datetime(2024, 5, 1, 12, 0, 0)
+        points = [
+            mod_gpx.GPXTrackPoint(45., 15., time=t0),
+            mod_gpx.GPXTrackPoint(float('nan'), float('nan'), t0 + mod_datetime.timedelta(seconds=300)),
+            mod_gpx.GPXTrackPoint(45., 15., time=t0 + mod_datetime.timedelta(seconds=600)),
+        ]
+
+        segment = mod_gpx.GPXTrackSegment(points)
+        self.assertEqual([], segment.get_stay_points(50., 600.))
+
+        points = [
+            mod_gpx.GPXTrackPoint(45., 15., time=t0),
+            mod_gpx.GPXTrackPoint(None, None, t0 + mod_datetime.timedelta(seconds=300)),  # type: ignore
+            mod_gpx.GPXTrackPoint(45., 15., time=t0 + mod_datetime.timedelta(seconds=600)),
+        ]
+        segment = mod_gpx.GPXTrackSegment(points)
+        self.assertEqual([], segment.get_stay_points(50., 600.))
+
+    def test_stay_points_do_not_cross_segment_boundaries(self) -> None:
+        t0 = mod_datetime.datetime(2024, 5, 1, 12, 0, 0)
+
+        def segment_with_parking() -> mod_gpx.GPXTrackSegment:
+            points = [mod_gpx.GPXTrackPoint(45., 15., time=t0 + mod_datetime.timedelta(seconds=60 * i))
+                      for i in range(12)]
+            return mod_gpx.GPXTrackSegment(points)
+
+        track = mod_gpx.GPXTrack()
+        track.segments.append(segment_with_parking())
+        track.segments.append(segment_with_parking())
+
+        stays = track.get_stay_points(50., 600., max_gap=300.)
+        self.assertEqual(2, len(stays))
+        self.assertEqual(0, stays[0].segment_no)
+        self.assertEqual(1, stays[1].segment_no)
+        self.assertEqual(-1, stays[0].track_no)
+
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(track)
+        stays = gpx.get_stay_points(50., 600., max_gap=300.)
+        self.assertEqual(2, len(stays))
+        self.assertEqual(0, stays[0].track_no)
+        self.assertEqual(0, stays[0].segment_no)
+        self.assertEqual(1, stays[1].segment_no)
+
 if __name__ == '__main__':
     mod_unittest.main()
