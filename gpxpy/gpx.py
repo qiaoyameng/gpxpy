@@ -2603,6 +2603,206 @@ class GPX:
         self.add_missing_data(get_data_function=lambda point: point.speed,
                               add_missing_function=_add)
 
+    def resample(self,
+                 time_delta: mod_datetime.timedelta,
+                 *,
+                 start_time: Optional[mod_datetime.datetime] = None,
+                 maximum_time_interval: Optional[mod_datetime.timedelta] = None) -> "GPX":
+        """
+        Return a copy with track points resampled at fixed time intervals.
+
+        Track points are interpolated along the shorter great-circle arc.
+        Elevation is linearly interpolated only when both endpoints have a
+        value. Gaps longer than maximum_time_interval are represented as new
+        segments, and points are never interpolated across existing segments.
+
+        All track-point times and start_time must be timezone-aware. Times are
+        compared as absolute instants, and output timestamps use the timezone
+        of start_time or the earliest track point. Consecutive points with the
+        same timestamp and location are ignored. Equal timestamps with
+        different locations, decreasing times, and exact antipodes raise
+        GPXException.
+
+        Parameters
+        ----------
+        time_delta: datetime.timedelta
+            Fixed interval between resampled points.
+        start_time: datetime.datetime, optional
+            Time defining the resampling grid. If omitted, the earliest track
+            point time is used.
+        maximum_time_interval: datetime.timedelta, optional
+            Maximum time gap that may be interpolated.
+        """
+        if time_delta <= mod_datetime.timedelta(0):
+            raise GPXException('time_delta must be positive')
+        if maximum_time_interval is not None and maximum_time_interval <= mod_datetime.timedelta(0):
+            raise GPXException('maximum_time_interval must be positive')
+
+        utc = mod_datetime.timezone.utc
+        epoch = mod_datetime.datetime(1970, 1, 1, tzinfo=utc)
+        step_microseconds = time_delta // mod_datetime.timedelta(microseconds=1)
+
+        def require_aware_time(point: GPXTrackPoint) -> mod_datetime.datetime:
+            if point.time is None:
+                raise GPXException('Cannot resample a track point without time')
+            if point.time.tzinfo is None or point.time.utcoffset() is None:
+                raise GPXException('Cannot resample a track point without timezone; provide timezone-aware times')
+            return point.time
+
+        def time_microseconds(time: mod_datetime.datetime) -> int:
+            return (time - epoch) // mod_datetime.timedelta(microseconds=1)
+
+        def same_point(first: GPXTrackPoint, second: GPXTrackPoint) -> bool:
+            first_longitude = ((first.longitude + 180) % 360) - 180
+            second_longitude = ((second.longitude + 180) % 360) - 180
+            return first.latitude == second.latitude and \
+                first_longitude == second_longitude and \
+                first.elevation == second.elevation
+
+        validated_tracks: List[List[List[Tuple[GPXTrackPoint, int]]]] = []
+        earliest_time_utc: Optional[mod_datetime.datetime] = None
+        earliest_source_time: Optional[mod_datetime.datetime] = None
+
+        for track in self.tracks:
+            validated_track: List[List[Tuple[GPXTrackPoint, int]]] = []
+            for segment in track.segments:
+                validated_segment: List[Tuple[GPXTrackPoint, int]] = []
+                previous_point: Optional[GPXTrackPoint] = None
+                previous_time: Optional[mod_datetime.datetime] = None
+
+                for point in segment.points:
+                    point_time = require_aware_time(point)
+                    point_time_utc = point_time.astimezone(utc)
+                    if not -90 <= point.latitude <= 90:
+                        raise GPXException(f'Invalid latitude: {point.latitude}')
+
+                    if previous_point is not None and previous_time is not None:
+                        if point_time_utc < previous_time:
+                            raise GPXException('Cannot resample a track with decreasing point times')
+                        if point_time_utc == previous_time:
+                            if not same_point(previous_point, point):
+                                raise GPXException('Cannot interpolate between two different locations at the same time')
+                            continue
+                        try:
+                            mod_geo.interpolate_great_circle(
+                                previous_point.latitude, previous_point.longitude,
+                                point.latitude, point.longitude, 0.5)
+                        except ValueError as error:
+                            raise GPXException(str(error)) from error
+
+                    point_microseconds = time_microseconds(point_time_utc)
+                    validated_segment.append((point, point_microseconds))
+                    if earliest_time_utc is None or point_time_utc < earliest_time_utc:
+                        earliest_time_utc = point_time_utc
+                        earliest_source_time = point_time
+                    previous_point = point
+                    previous_time = point_time_utc
+
+                validated_track.append(validated_segment)
+            validated_tracks.append(validated_track)
+
+        if start_time is None:
+            if earliest_source_time is None:
+                return self.clone()
+            grid_start_time = earliest_source_time
+        else:
+            if start_time.tzinfo is None or start_time.utcoffset() is None:
+                raise GPXException('start_time must be timezone-aware')
+            grid_start_time = start_time
+
+        grid_start_microseconds = time_microseconds(grid_start_time.astimezone(utc))
+
+        def interpolated_point(first: GPXTrackPoint, second: GPXTrackPoint,
+                               first_microseconds: int, second_microseconds: int,
+                               sample_microseconds: int) -> GPXTrackPoint:
+            if second_microseconds == first_microseconds:
+                ratio = 0.0
+            else:
+                ratio = (sample_microseconds - first_microseconds) / (second_microseconds - first_microseconds)
+            try:
+                latitude, longitude = mod_geo.interpolate_great_circle(
+                    first.latitude, first.longitude,
+                    second.latitude, second.longitude,
+                    ratio)
+            except ValueError as error:
+                raise GPXException(str(error)) from error
+
+            elevation: Optional[float] = None
+            if ratio == 0:
+                elevation = first.elevation
+            elif ratio == 1:
+                elevation = second.elevation
+            elif first.elevation is not None and second.elevation is not None:
+                elevation = first.elevation + (second.elevation - first.elevation) * ratio
+
+            return GPXTrackPoint(
+                latitude=latitude,
+                longitude=longitude,
+                elevation=elevation,
+                time=(epoch + mod_datetime.timedelta(microseconds=sample_microseconds)).astimezone(
+                    grid_start_time.tzinfo))
+
+        resampled_tracks: List[List[GPXTrackSegment]] = []
+
+        for track_index, validated_track in enumerate(validated_tracks):
+            resampled_track: List[GPXTrackSegment] = []
+            for segment_index, validated_segment in enumerate(validated_track):
+                source_segment = self.tracks[track_index].segments[segment_index]
+                first_resampled_segment = GPXTrackSegment()
+                first_resampled_segment.extensions = mod_copy.deepcopy(source_segment.extensions)
+                resampled_segments: List[GPXTrackSegment] = [first_resampled_segment]
+
+                if len(validated_segment) == 1:
+                    point, point_microseconds = validated_segment[0]
+                    if (point_microseconds - grid_start_microseconds) % step_microseconds == 0:
+                        resampled_segments[0].points.append(interpolated_point(
+                            point, point, point_microseconds, point_microseconds, point_microseconds))
+                else:
+                    last_appended_microseconds: Optional[int] = None
+                    for point_no, (point, point_microseconds) in enumerate(validated_segment[1:], 1):
+                        previous_point, previous_microseconds = validated_segment[point_no - 1]
+                        gap = mod_datetime.timedelta(microseconds=point_microseconds - previous_microseconds)
+
+                        if point_no == 1 and last_appended_microseconds != previous_microseconds and \
+                                (previous_microseconds - grid_start_microseconds) % step_microseconds == 0:
+                            resampled_segments[-1].points.append(interpolated_point(
+                                previous_point, previous_point,
+                                previous_microseconds, previous_microseconds,
+                                previous_microseconds))
+                            last_appended_microseconds = previous_microseconds
+
+                        if maximum_time_interval is not None and gap > maximum_time_interval:
+                            split_segment = GPXTrackSegment()
+                            split_segment.extensions = mod_copy.deepcopy(source_segment.extensions)
+                            resampled_segments.append(split_segment)
+                            last_appended_microseconds = None
+                            if (point_microseconds - grid_start_microseconds) % step_microseconds == 0:
+                                resampled_segments[-1].points.append(interpolated_point(
+                                    point, point, point_microseconds, point_microseconds, point_microseconds))
+                                last_appended_microseconds = point_microseconds
+                            continue
+
+                        first_index = (previous_microseconds - grid_start_microseconds + step_microseconds - 1) \
+                            // step_microseconds
+                        last_index = (point_microseconds - grid_start_microseconds) // step_microseconds
+                        for index in range(first_index, last_index + 1):
+                            sample_microseconds = grid_start_microseconds + index * step_microseconds
+                            if previous_microseconds < sample_microseconds <= point_microseconds:
+                                resampled_segments[-1].points.append(interpolated_point(
+                                    previous_point, point,
+                                    previous_microseconds, point_microseconds,
+                                    sample_microseconds))
+                                last_appended_microseconds = sample_microseconds
+
+                resampled_track.extend(resampled_segments)
+            resampled_tracks.append(resampled_track)
+
+        result = self.clone()
+        for track, resampled_segments in zip(result.tracks, resampled_tracks):
+            track.segments = resampled_segments
+
+        return result
+
     def fill_time_data_with_regular_intervals(self, start_time: Optional[mod_datetime.datetime]=None, time_delta: Optional[mod_datetime.timedelta]=None, end_time: Optional[mod_datetime.datetime]=None, force: bool=True) -> None:
         """
         Fills the time data for all points in the GPX file. At least two of the parameters start_time, time_delta, and

@@ -100,6 +100,84 @@ def get_course(latitude_1: float, longitude_1: float, latitude_2: float, longitu
     return course % 360
 
 
+def interpolate_great_circle(latitude_1: float, longitude_1: float,
+                             latitude_2: float, longitude_2: float,
+                             ratio: float) -> Tuple[float, float]:
+    """
+    Interpolate between two coordinates along the shorter great-circle arc.
+
+    ratio must be between 0 and 1. The result is a (latitude, longitude)
+    tuple. Linear interpolation of longitude is intentionally not used.
+    """
+    if not 0 <= ratio <= 1:
+        raise ValueError(f'Interpolation ratio must be between 0 and 1, got {ratio}')
+
+    latitude_1 = max(-90, min(90, latitude_1))
+    latitude_2 = max(-90, min(90, latitude_2))
+    longitude_1 = ((longitude_1 + 180) % 360) - 180
+    longitude_2 = ((longitude_2 + 180) % 360) - 180
+
+    if ratio == 0:
+        return latitude_1, longitude_1
+    if ratio == 1:
+        return latitude_2, longitude_2
+
+    lat1 = mod_math.radians(latitude_1)
+    lon1 = mod_math.radians(longitude_1)
+    lat2 = mod_math.radians(latitude_2)
+    lon2 = mod_math.radians(longitude_2)
+
+    x1 = mod_math.cos(lat1) * mod_math.cos(lon1)
+    y1 = mod_math.cos(lat1) * mod_math.sin(lon1)
+    z1 = mod_math.sin(lat1)
+    x2 = mod_math.cos(lat2) * mod_math.cos(lon2)
+    y2 = mod_math.cos(lat2) * mod_math.sin(lon2)
+    z2 = mod_math.sin(lat2)
+
+    dot = max(-1, min(1, x1 * x2 + y1 * y2 + z1 * z2))
+    near_antipodal = dot < -1 + 1e-12
+
+    if near_antipodal:
+        axis_x = y1 * z2 - z1 * y2
+        axis_y = z1 * x2 - x1 * z2
+        axis_z = x1 * y2 - y1 * x2
+        axis_norm = mod_math.sqrt(axis_x * axis_x + axis_y * axis_y + axis_z * axis_z)
+        if axis_norm < 1e-12:
+            raise ValueError('Cannot interpolate between two exact antipodes: the shorter arc is not unique')
+        axis_x /= axis_norm
+        axis_y /= axis_norm
+        axis_z /= axis_norm
+
+        angle = mod_math.acos(dot) * ratio
+        cross_x = axis_y * z1 - axis_z * y1
+        cross_y = axis_z * x1 - axis_x * z1
+        cross_z = axis_x * y1 - axis_y * x1
+        sin_angle = mod_math.sin(angle)
+        cos_angle = mod_math.cos(angle)
+        x = x1 * cos_angle + cross_x * sin_angle
+        y = y1 * cos_angle + cross_y * sin_angle
+        z = z1 * cos_angle + cross_z * sin_angle
+    else:
+        omega = mod_math.acos(dot)
+        sin_omega = mod_math.sin(omega)
+        if sin_omega < 1e-15:
+            return latitude_1, longitude_1
+        coefficient_1 = mod_math.sin((1 - ratio) * omega) / sin_omega
+        coefficient_2 = mod_math.sin(ratio * omega) / sin_omega
+        x = x1 * coefficient_1 + x2 * coefficient_2
+        y = y1 * coefficient_1 + y2 * coefficient_2
+        z = z1 * coefficient_1 + z2 * coefficient_2
+
+    vector_norm = mod_math.sqrt(x * x + y * y + z * z)
+    x /= vector_norm
+    y /= vector_norm
+    z /= vector_norm
+
+    latitude = mod_math.degrees(mod_math.asin(max(-1, min(1, z))))
+    longitude = mod_math.degrees(mod_math.atan2(y, x))
+    return latitude, ((longitude + 180) % 360) - 180
+
+
 def length(locations: List["Location"]=[], _3d: bool=False) -> float:
     """
     Compute the total length between locations.
