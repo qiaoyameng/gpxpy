@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.timecalib as mod_timecalib
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3705,6 +3706,128 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    def _make_calibration_route(self) -> Tuple[List[float], List[float], List[float]]:
+        # Synthetic ride with several turns and stops, sampled every 2 s.
+        # Legs: (east_m, north_m, speed_m/s); a zero-distance leg is a stop
+        # whose "speed" field is the stop duration in seconds.
+        legs = [(300.0, 0.0, 3.0), (0.0, 0.0, 60.0), (0.0, 200.0, 3.0),
+                (0.0, 0.0, 45.0), (-150.0, 0.0, 2.5), (0.0, -100.0, 3.0),
+                (0.0, 0.0, 30.0), (150.0, 100.0, 3.0)]
+        sample_interval = 2.0
+        times: List[float] = []
+        eastings: List[float] = []
+        northings: List[float] = []
+        elapsed = 0.0
+        east = 0.0
+        north = 0.0
+        for leg_east, leg_north, speed in legs:
+            distance = mod_math.hypot(leg_east, leg_north)
+            duration = distance / speed if distance > 0 else speed
+            steps = max(1, int(duration / sample_interval))
+            for step in range(steps):
+                ratio = step / steps
+                times.append(elapsed + ratio * duration)
+                eastings.append(east + ratio * leg_east)
+                northings.append(north + ratio * leg_north)
+            elapsed += duration
+            east += leg_east
+            north += leg_north
+        times.append(elapsed)
+        eastings.append(east)
+        northings.append(north)
+        return times, eastings, northings
+
+    def _make_calibration_gpx(self, times: List[float], eastings: List[float],
+                              northings: List[float], start: mod_datetime.datetime,
+                              time_shift: Optional[Callable[[float], float]]=None) -> mod_gpx.GPX:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        segment = mod_gpx.GPXTrackSegment()
+        track.segments.append(segment)
+        latitude_0 = 45.0
+        for i, t in enumerate(times):
+            latitude = latitude_0 + northings[i] / mod_geo.ONE_DEGREE
+            longitude = eastings[i] / (mod_geo.ONE_DEGREE * mod_math.cos(mod_math.radians(latitude_0)))
+            shift = time_shift(t) if time_shift is not None else 0.0
+            point_time = start + mod_datetime.timedelta(seconds=t + shift)
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                latitude=latitude, longitude=longitude, elevation=100.0, time=point_time))
+        return gpx
+
+    def test_time_calibration_recovers_offset_and_drift(self) -> None:
+        times, eastings, northings = self._make_calibration_route()
+        start = mod_datetime.datetime(2020, 5, 1, 8, 0, 0, tzinfo=mod_datetime.timezone.utc)
+        reference = self._make_calibration_gpx(times, eastings, northings, start)
+
+        true_offset = 42.0
+        true_drift = 1.5e-3
+        t_ref = times[-1] / 2.0
+        # Exact inverse of corrected = t + offset + drift * (t - t_ref):
+        time_shift = lambda t: (t - true_offset + true_drift * t_ref) / (1.0 + true_drift) - t
+        target = self._make_calibration_gpx(times, eastings, northings, start, time_shift)
+
+        # Inject one localisation outlier (~1.1 km off) into the target:
+        target.tracks[0].segments[0].points[len(times) // 3].latitude += 0.01
+        # An extension which must survive the correction untouched:
+        extension = mod_minidom.parseString('<hr xmlns="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">88</hr>')
+        target.tracks[0].segments[0].points[10].extensions.append(extension.documentElement)
+
+        result = mod_timecalib.calibrate_time(
+            reference, target, max_offset=90.0, max_drift=4e-3,
+            t_ref=start.timestamp() + t_ref, offset_step=3.0, drift_steps=31)
+
+        self.assertFalse(result.uncertain, result.uncertainty_reasons)
+        self.assertIsNotNone(result.offset)
+        self.assertIsNotNone(result.drift)
+        self.assertIsNotNone(result.corrected)
+        assert result.offset is not None and result.drift is not None and result.corrected is not None
+        self.assertAlmostEqual(true_offset, result.offset, delta=2.0)
+        self.assertAlmostEqual(true_drift, result.drift, delta=2e-4)
+
+        corrected_points = list(result.corrected.walk(only_points=True))
+        target_points = list(target.walk(only_points=True))
+        reference_points = list(reference.walk(only_points=True))
+        self.assertEqual(len(reference_points), len(corrected_points))
+        max_time_error = 0.0
+        for i, corrected_point in enumerate(corrected_points):
+            # Correction must only touch times, not coordinates/extensions:
+            self.assertEqual(target_points[i].latitude, corrected_point.latitude)
+            self.assertEqual(target_points[i].longitude, corrected_point.longitude)
+            self.assertEqual(target_points[i].elevation, corrected_point.elevation)
+            assert corrected_point.time is not None and reference_points[i].time is not None
+            error = abs((corrected_point.time - reference_points[i].time).total_seconds())
+            if i != len(times) // 3:  # the outlier point still gets the same time transform
+                max_time_error = max(max_time_error, error)
+        self.assertLessEqual(max_time_error, 2.0)
+        self.assertEqual(1, len(corrected_points[10].extensions))
+        self.assertEqual('hr', corrected_points[10].extensions[0].tagName)
+
+    def test_time_calibration_stationary_track_is_uncertain(self) -> None:
+        times, eastings, northings = self._make_calibration_route()
+        start = mod_datetime.datetime(2020, 5, 1, 8, 0, 0, tzinfo=mod_datetime.timezone.utc)
+        # A "ride" that never moves:
+        still_eastings = [0.0 for _ in times]
+        still_northings = [0.0 for _ in times]
+        reference = self._make_calibration_gpx(times, still_eastings, still_northings, start)
+        target = self._make_calibration_gpx(times, still_eastings, still_northings, start,
+                                            lambda t: 30.0)
+        result = mod_timecalib.calibrate_time(reference, target, max_offset=90.0, max_drift=4e-3)
+        self.assertTrue(result.uncertain)
+        self.assertTrue(any('stationary' in reason for reason in result.uncertainty_reasons))
+
+    def test_time_calibration_short_overlap_is_uncertain(self) -> None:
+        times, eastings, northings = self._make_calibration_route()
+        start = mod_datetime.datetime(2020, 5, 1, 8, 0, 0, tzinfo=mod_datetime.timezone.utc)
+        reference = self._make_calibration_gpx(times, eastings, northings, start)
+        # Target recorded an hour after the reference: no overlap at all.
+        target = self._make_calibration_gpx(times, eastings, northings, start,
+                                            lambda t: 3600.0)
+        result = mod_timecalib.calibrate_time(reference, target, max_offset=90.0, max_drift=4e-3)
+        self.assertTrue(result.uncertain)
+        self.assertIsNone(result.corrected)
+        self.assertTrue(any('overlap' in reason for reason in result.uncertainty_reasons))
 
 if __name__ == '__main__':
     mod_unittest.main()
