@@ -1808,6 +1808,216 @@ class GPXTests(mod_unittest.TestCase):
 
         gpx.simplify()
 
+    def _make_straight_line_speed_change_segment(self) -> mod_gpx.GPXTrackSegment:
+        """A perfectly straight line (constant latitude, evenly spaced
+        longitudes) but with braking, a stop and acceleration in time."""
+        segment = mod_gpx.GPXTrackSegment()
+        start = mod_datetime.datetime(2020, 1, 1, 12, 0, 0)
+        time_offset = 0.0
+        longitude = 13.0
+        steps = ([(1.0, 0.0001)] * 10     # fast, constant speed
+                 + [(10.0, 0.0001)] * 10  # braking to a crawl, constant speed
+                 + [(60.0, 0.0)]          # stopped for a minute
+                 + [(1.0, 0.0001)] * 10)  # accelerating away, constant speed
+        for delta_seconds, delta_longitude in steps:
+            time_offset += delta_seconds
+            longitude += delta_longitude
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                    latitude=45.0, longitude=longitude,
+                    time=start + mod_datetime.timedelta(seconds=time_offset)))
+        return segment
+
+    def _max_time_interpolation_error(self, run: List[mod_gpx.GPXTrackPoint],
+                                      kept: List[mod_gpx.GPXTrackPoint]) -> float:
+        """Maximal distance between a removed point of run and its position
+        linearly interpolated in time between the neighbouring kept points."""
+        max_error = 0.0
+        for kept_index in range(len(kept) - 1):
+            start, end = kept[kept_index], kept[kept_index + 1]
+            start_index, end_index = run.index(start), run.index(end)
+            for index in range(start_index + 1, end_index):
+                point = run[index]
+                assert point.time is not None and start.time is not None and end.time is not None
+                ratio = ((point.time - start.time).total_seconds()
+                         / (end.time - start.time).total_seconds())
+                latitude = start.latitude + (end.latitude - start.latitude) * ratio
+                longitude = start.longitude + (end.longitude - start.longitude) * ratio
+                elevation: Optional[float] = None
+                if start.elevation is not None and end.elevation is not None:
+                    elevation = start.elevation + (end.elevation - start.elevation) * ratio
+                error = mod_geo.distance(latitude, longitude, elevation,
+                                         point.latitude, point.longitude, point.elevation)
+                max_error = max(max_error, error)
+        return max_error
+
+    def _brute_force_min_kept(self, run: List[mod_gpx.GPXTrackPoint], max_distance: float,
+                              required_indices: Set[int]) -> Optional[int]:
+        """Reference implementation: enumerates all point subsets and returns
+        the size of the smallest one satisfying the time-interpolation bound."""
+        n = len(run)
+        best: Optional[int] = None
+        for mask in range(1 << n):
+            indices = {i for i in range(n) if mask & (1 << i)}
+            if not ({0, n - 1} | required_indices) <= indices:
+                continue
+            if best is not None and len(indices) >= best:
+                continue
+            kept = [run[i] for i in sorted(indices)]
+            if self._max_time_interpolation_error(run, kept) <= max_distance:
+                best = len(indices)
+        return best
+
+    def test_simplify_time_aware_straight_line_speed_changes(self) -> None:
+        # Ramer-Douglas-Peucker keeps only the shape: everything on the
+        # straight line is removed, including braking and the stop:
+        segment = self._make_straight_line_speed_change_segment()
+        segment.simplify(max_distance=10.0)
+        self.assertEqual(2, len(segment.points))
+
+        segment = self._make_straight_line_speed_change_segment()
+        original = list(segment.points)
+        segment.simplify_time_aware(max_distance=2.0)
+        kept = segment.points
+
+        # The speed changes survive, and the result is the exact minimum:
+        self.assertEqual(5, len(kept))
+        self.assertTrue(kept[0] is original[0])
+        self.assertTrue(kept[-1] is original[-1])
+        # The points around the stop are kept:
+        self.assertTrue(any(original[19] is point for point in kept))
+        self.assertTrue(any(original[20] is point for point in kept))
+        # Kept points are the original point objects:
+        for point in kept:
+            self.assertTrue(any(point is original_point for original_point in original))
+        # The interpolation error bound holds for every removed point:
+        self.assertTrue(self._max_time_interpolation_error(original, kept) <= 2.0)
+
+    def test_simplify_time_aware_preserves_point_identity(self) -> None:
+        segment = self._make_straight_line_speed_change_segment()
+        original = list(segment.points)
+        for index, point in enumerate(original):
+            point.extensions.append(f'extension-{index}')
+        segment.simplify_time_aware(max_distance=2.0)
+        for point in segment.points:
+            index = next(i for i, original_point in enumerate(original) if original_point is point)
+            self.assertEqual([f'extension-{index}'], point.extensions)
+
+    def test_simplify_time_aware_brute_force(self) -> None:
+        mod_random.seed(42)
+        start = mod_datetime.datetime(2020, 1, 1)
+        for n in (6, 8, 10):
+            for _ in range(5):
+                run: List[mod_gpx.GPXTrackPoint] = []
+                time_offset = 0.0
+                latitude, longitude = 45.0, 13.0
+                for _ in range(n):
+                    time_offset += mod_random.uniform(0.5, 5.0)
+                    latitude += mod_random.uniform(-0.0005, 0.0005)
+                    longitude += mod_random.uniform(-0.0005, 0.0005)
+                    run.append(mod_gpx.GPXTrackPoint(
+                            latitude=latitude, longitude=longitude,
+                            time=start + mod_datetime.timedelta(seconds=time_offset)))
+                for max_distance in (1.0, 10.0, 50.0):
+                    for anchor_index in (None, n // 2):
+                        anchors = [run[anchor_index]] if anchor_index is not None else None
+                        segment = mod_gpx.GPXTrackSegment(list(run))
+                        segment.simplify_time_aware(max_distance, anchors=anchors)
+                        required = {anchor_index} if anchor_index is not None else set()
+                        expected = self._brute_force_min_kept(run, max_distance, required)
+                        self.assertEqual(expected, len(segment.points))
+                        self.assertTrue(self._max_time_interpolation_error(run, segment.points) <= max_distance)
+
+    def test_simplify_time_aware_anchors(self) -> None:
+        segment = self._make_straight_line_speed_change_segment()
+        original = list(segment.points)
+        # A point in the constant-speed fast section, normally removed:
+        anchor = original[3]
+        segment.simplify_time_aware(max_distance=2.0, anchors=[anchor])
+        self.assertTrue(any(anchor is point for point in segment.points))
+        self.assertEqual(6, len(segment.points))
+        self.assertTrue(self._max_time_interpolation_error(original, segment.points) <= 2.0)
+
+        # Anchors that are not part of the segment are ignored:
+        segment = self._make_straight_line_speed_change_segment()
+        segment.simplify_time_aware(max_distance=2.0,
+                                    anchors=[mod_gpx.GPXTrackPoint(latitude=1, longitude=2)])
+        self.assertEqual(5, len(segment.points))
+
+    def test_simplify_time_aware_missing_and_backwards_time(self) -> None:
+        segment = self._make_straight_line_speed_change_segment()
+        original = list(segment.points)
+        original[5].time = None
+        segment.simplify_time_aware(max_distance=2.0)
+        kept = segment.points
+        # The point without time and both its neighbours are always kept:
+        for index in (4, 5, 6):
+            self.assertTrue(any(original[index] is point for point in kept))
+        # The bound still holds on both sides of the gap:
+        kept_before = [point for point in kept if any(point is p for p in original[:6])]
+        kept_after = [point for point in kept if any(point is p for p in original[6:])]
+        self.assertTrue(self._max_time_interpolation_error(original[:6], kept_before) <= 2.0)
+        self.assertTrue(self._max_time_interpolation_error(original[6:], kept_after) <= 2.0)
+
+        segment = self._make_straight_line_speed_change_segment()
+        original = list(segment.points)
+        previous_time = original[9].time
+        assert previous_time is not None
+        original[10].time = previous_time - mod_datetime.timedelta(seconds=1)
+        segment.simplify_time_aware(max_distance=2.0)
+        # Compression never crosses the backwards time step:
+        self.assertTrue(any(original[9] is point for point in segment.points))
+        self.assertTrue(any(original[10] is point for point in segment.points))
+
+    def test_simplify_time_aware_does_not_cross_segments(self) -> None:
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        gpx.tracks[0].segments.append(self._make_straight_line_speed_change_segment())
+        gpx.tracks[0].segments.append(self._make_straight_line_speed_change_segment())
+        first_original = list(gpx.tracks[0].segments[0].points)
+        second_original = list(gpx.tracks[0].segments[1].points)
+        gpx.simplify_time_aware(max_distance=2.0)
+        first_kept = gpx.tracks[0].segments[0].points
+        second_kept = gpx.tracks[0].segments[1].points
+        self.assertEqual(5, len(first_kept))
+        self.assertEqual(5, len(second_kept))
+        self.assertTrue(first_kept[0] is first_original[0])
+        self.assertTrue(first_kept[-1] is first_original[-1])
+        self.assertTrue(second_kept[0] is second_original[0])
+        self.assertTrue(second_kept[-1] is second_original[-1])
+        self.assertTrue(self._max_time_interpolation_error(first_original, first_kept) <= 2.0)
+        self.assertTrue(self._max_time_interpolation_error(second_original, second_kept) <= 2.0)
+
+    def test_simplify_time_aware_max_checks_exceeded(self) -> None:
+        segment = self._make_straight_line_speed_change_segment()
+        # Explicit refusal instead of silently returning an inexact result:
+        self.assertRaises(mod_gpx.GPXSimplifyException,
+                          segment.simplify_time_aware, 2.0, None, 1)
+        # Points are left untouched and the exception is a GPXException:
+        self.assertEqual(31, len(segment.points))
+        self.assertTrue(issubclass(mod_gpx.GPXSimplifyException, mod_gpx.GPXException))
+
+        self.assertRaises(mod_gpx.GPXException, segment.simplify_time_aware, -1.0)
+
+    def test_simplify_time_aware_elevation(self) -> None:
+        start = mod_datetime.datetime(2020, 1, 1)
+        # Straight line at constant speed, elevation spike above the bound:
+        segment = mod_gpx.GPXTrackSegment()
+        for index, elevation in enumerate((0.0, 100.0, 0.0)):
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                    latitude=45.0, longitude=13.0 + index * 0.0001, elevation=elevation,
+                    time=start + mod_datetime.timedelta(seconds=index)))
+        segment.simplify_time_aware(max_distance=10.0)
+        self.assertEqual(3, len(segment.points))
+
+        # Elevation change below the bound is interpolated away:
+        segment = mod_gpx.GPXTrackSegment()
+        for index, elevation in enumerate((0.0, 5.0, 0.0)):
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                    latitude=45.0, longitude=13.0 + index * 0.0001, elevation=elevation,
+                    time=start + mod_datetime.timedelta(seconds=index)))
+        segment.simplify_time_aware(max_distance=10.0)
+        self.assertEqual(2, len(segment.points))
+
     def test_nan_elevation(self) -> None:
         xml = '<?xml version="1.0" encoding="UTF-8"?><gpx> <wpt lat="12" lon="13"> <ele>nan</ele></wpt> <rte> <rtept lat="12" lon="13"> <ele>nan</ele></rtept></rte> <trk> <name/> <desc/> <trkseg> <trkpt lat="12" lon="13"> <ele>nan</ele></trkpt></trkseg></trk></gpx>'
         gpx = mod_gpxpy.parse(xml)

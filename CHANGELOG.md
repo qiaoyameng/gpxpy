@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added `simplify_time_aware` (on `GPX`, `GPXTrack` and `GPXTrackSegment`): replay-oriented simplification that keeps the fewest points such that every removed point is within `max_distance` meters of its time-interpolated position between the neighbouring kept points. First/last and caller-given anchor points are always kept, compression never crosses segment boundaries, missing timestamps or non-increasing time, and kept points are the original point objects. The result is exact within the `max_checks` resource limit, otherwise `GPXSimplifyException` is raised.
+
 ## v1.6.1
 
 - Minor fix

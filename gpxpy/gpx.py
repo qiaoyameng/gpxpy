@@ -49,6 +49,12 @@ SMOOTHING_RATIO = (0.4, 0.2, 0.4)
 # if speed is less than this value -- we'll assume it is zero
 DEFAULT_STOPPED_SPEED_THRESHOLD = 1
 
+# Default resource limit for time-aware simplification, counted as the number
+# of point-vs-chord interpolation error evaluations. If an exact result needs
+# more checks than this, GPXSimplifyException is raised instead of silently
+# returning an approximate result:
+DEFAULT_SIMPLIFY_TIME_AWARE_MAX_CHECKS = 10_000_000
+
 # Fields used for all point elements (route point, track point, waypoint):
 GPX_10_POINT_FIELDS = [
         mod_gpxfield.GPXField('latitude', attribute='lat', type=mod_gpxfield.FLOAT_TYPE, mandatory=True),
@@ -144,6 +150,14 @@ class GPXException(Exception):
     """
     Exception used for invalid GPX files. It is used when the XML file is
     valid but something is wrong with the GPX data.
+    """
+    pass
+
+
+class GPXSimplifyException(GPXException):
+    """
+    Raised when a simplification cannot compute an exact result within the
+    given resource limit.
     """
     pass
 
@@ -684,6 +698,161 @@ class GPXTrackPoint(mod_geo.Location):
     def __str__(self) -> str:
         return f'[trkpt:{self.latitude},{self.longitude}@{self.elevation}@{self.time}]'
 
+
+def _time_interpolated_distance(start: "GPXTrackPoint", point: "GPXTrackPoint", end: "GPXTrackPoint",
+                                start_seconds: float, point_seconds: float, end_seconds: float) -> float:
+    """
+    Distance (in meters) between `point` and the position obtained by
+    linearly interpolating latitude, longitude and elevation between `start`
+    and `end` at the time of `point`. Times are given as seconds relative to
+    an arbitrary common epoch. Elevation is interpolated only when both
+    endpoints have one, otherwise a 2D distance is computed.
+    """
+    ratio = (point_seconds - start_seconds) / (end_seconds - start_seconds)
+    latitude = start.latitude + (end.latitude - start.latitude) * ratio
+    longitude = start.longitude + (end.longitude - start.longitude) * ratio
+    elevation: Optional[float] = None
+    if start.elevation is not None and end.elevation is not None:
+        elevation = start.elevation + (end.elevation - start.elevation) * ratio
+    return mod_geo.distance(latitude, longitude, elevation,
+                            point.latitude, point.longitude, point.elevation)
+
+
+def _simplify_time_aware_run(run: List["GPXTrackPoint"], max_distance: float,
+                             anchor_ids: Set[int], checks_left: int) -> Tuple[List["GPXTrackPoint"], int]:
+    """
+    Computes the minimal set of kept points for a run of points with strictly
+    increasing timestamps, such that every removed point is within
+    max_distance (meters) of the position linearly interpolated in time
+    between its neighbouring kept points. Points whose id() is in anchor_ids
+    are always kept, as are the first and last points of the run.
+
+    Returns the kept points (the original point objects, in order) and the
+    number of interpolation checks used. Raises GPXSimplifyException if an
+    exact result would need more than checks_left checks.
+    """
+    n = len(run)
+    if n <= 2:
+        return list(run), 0
+
+    base_time = run[0].time
+    assert base_time is not None
+    times: List[float] = []
+    for point in run:
+        assert point.time is not None
+        times.append((point.time - base_time).total_seconds())
+
+    anchors = {i for i, point in enumerate(run) if id(point) in anchor_ids}
+    anchors.add(0)
+    anchors.add(n - 1)
+
+    # Furthest index reachable from i without skipping an anchor:
+    next_anchor = [n - 1] * n
+    upcoming = n - 1
+    for i in range(n - 2, -1, -1):
+        if i + 1 in anchors:
+            upcoming = i + 1
+        next_anchor[i] = upcoming
+
+    # Shortest-path DP on the DAG of valid chords: best[j] is the minimal
+    # number of kept points covering run[0..j] with j kept. Edge (i, j) is
+    # valid when it skips no anchor and every intermediate point is within
+    # max_distance of the time-interpolated chord. Edges are only checked
+    # when they could improve best[j], and the search stops as soon as
+    # best[n-1] reaches its lower bound (every kept set must contain all
+    # anchors); both are exact.
+    best = [n + 1] * n
+    previous = [-1] * n
+    best[0] = 1
+    checks = 0
+    min_possible = len(anchors)
+    for i in range(n - 1):
+        if best[i] > n or best[n - 1] <= min_possible:
+            continue
+        start = run[i]
+        start_seconds = times[i]
+        for j in range(next_anchor[i], i, -1):
+            if best[n - 1] <= min_possible:
+                break
+            if best[j] <= best[i] + 1:
+                # Edge (i, j) cannot improve best[j], no need to check it:
+                continue
+            end = run[j]
+            end_seconds = times[j]
+            valid = True
+            for k in range(i + 1, j):
+                checks += 1
+                if checks > checks_left:
+                    raise GPXSimplifyException(
+                            'Time-aware simplification exceeded the remaining interpolation check '
+                            f'budget ({checks_left}); increase max_checks or simplify fewer points at once')
+                if _time_interpolated_distance(start, run[k], end,
+                                               start_seconds, times[k], end_seconds) > max_distance:
+                    valid = False
+                    break
+            if valid and best[i] + 1 < best[j]:
+                best[j] = best[i] + 1
+                previous[j] = i
+
+    kept_indices: List[int] = []
+    index = n - 1
+    while index >= 0:
+        kept_indices.append(index)
+        index = previous[index]
+    kept_indices.reverse()
+    return [run[i] for i in kept_indices], checks
+
+
+def _simplify_time_aware_points(points: List["GPXTrackPoint"], max_distance: float,
+                                anchor_ids: Set[int], checks_left: int) -> Tuple[List["GPXTrackPoint"], int]:
+    """
+    Time-aware simplification of a list of points. The list is split into
+    runs of strictly increasing timestamps: points without a timestamp are
+    always kept and never interpolated across, and a non-increasing time
+    step ends the current run, so compression never crosses missing or
+    backwards time. Each run is simplified exactly (minimal number of kept
+    points) with _simplify_time_aware_run.
+
+    Returns the kept points (the original point objects, in order) and the
+    number of interpolation checks used. Raises GPXSimplifyException if an
+    exact result would need more than checks_left checks.
+    """
+    if max_distance < 0:
+        raise GPXException('max_distance must not be negative')
+
+    runs: List[List[GPXTrackPoint]] = []
+    current: List[GPXTrackPoint] = []
+    for point in points:
+        last_time = current[-1].time if current else None
+        if point.time is None:
+            if current:
+                runs.append(current)
+                current = []
+            runs.append([point])
+        elif last_time is not None and point.time <= last_time:
+            runs.append(current)
+            current = [point]
+        else:
+            current.append(point)
+    if current:
+        runs.append(current)
+
+    result: List[GPXTrackPoint] = []
+    checks_used = 0
+    for run in runs:
+        kept, used = _simplify_time_aware_run(run, max_distance, anchor_ids, checks_left - checks_used)
+        result.extend(kept)
+        checks_used += used
+    return result, checks_used
+
+
+def _time_aware_simplify_params(anchors: Optional[Iterable["GPXTrackPoint"]],
+                                max_checks: Optional[int]) -> Tuple[Set[int], int]:
+    anchor_ids = {id(point) for point in anchors} if anchors else set()
+    checks_left = DEFAULT_SIMPLIFY_TIME_AWARE_MAX_CHECKS if max_checks is None else max_checks
+    return anchor_ids, checks_left
+
+
 class GPXTrackSegment:
     gpx_10_fields = [
             mod_gpxfield.GPXComplexField('points', tag='trkpt', classs=GPXTrackPoint, is_list=True),
@@ -704,6 +873,40 @@ class GPXTrackSegment:
         Simplify using the Ramer-Douglas-Peucker algorithm: http://en.wikipedia.org/wiki/Ramer-Douglas-Peucker_algorithm
         """
         self.points = mod_geo.simplify_polyline(self.points, max_distance) # type: ignore
+
+    def simplify_time_aware(self, max_distance: float, anchors: Optional[Iterable[GPXTrackPoint]]=None,
+                            max_checks: Optional[int]=None) -> None:
+        """
+        Replay-oriented simplification: keeps the fewest points such that
+        every removed point is within max_distance (meters) of the position
+        obtained by linearly interpolating its timestamp between the
+        neighbouring kept points. Unlike simplify() (Ramer-Douglas-Peucker),
+        this preserves speed changes, braking and stops on straight lines.
+
+        The first and last points and all points in anchors are always kept.
+        Points without a timestamp are always kept and never interpolated
+        across, and compression never crosses a non-increasing time step.
+        Kept points are the original point objects, so their extensions and
+        other fields stay attached.
+
+        The result is exact (minimal number of kept points per run) as long
+        as it needs at most max_checks interpolation error evaluations;
+        otherwise GPXSimplifyException is raised instead of silently
+        returning an inexact result.
+
+        Parameters
+        ----------
+        max_distance : float
+            Maximal allowed distance in meters between an original point and
+            its time-interpolated position on the simplified track
+        anchors : iterable of GPXTrackPoint
+            Points that must be kept (matched by identity)
+        max_checks : int
+            Resource limit counted in interpolation error evaluations
+            (default DEFAULT_SIMPLIFY_TIME_AWARE_MAX_CHECKS)
+        """
+        anchor_ids, checks_left = _time_aware_simplify_params(anchors, max_checks)
+        self.points, _ = _simplify_time_aware_points(self.points, max_distance, anchor_ids, checks_left)
 
     def reduce_points(self, min_distance: float) -> None:
         """
@@ -1436,6 +1639,19 @@ class GPXTrack:
         for segment in self.segments:
             segment.simplify(max_distance=max_distance)
 
+    def simplify_time_aware(self, max_distance: float, anchors: Optional[Iterable[GPXTrackPoint]]=None,
+                            max_checks: Optional[int]=None) -> None:
+        """
+        Replay-oriented simplification of every segment, see
+        GPXTrackSegment.simplify_time_aware. Segments are simplified
+        independently, so compression never crosses segment boundaries.
+        max_checks limits the total work over all segments.
+        """
+        anchor_ids, checks_left = _time_aware_simplify_params(anchors, max_checks)
+        for segment in self.segments:
+            segment.points, used = _simplify_time_aware_points(segment.points, max_distance, anchor_ids, checks_left)
+            checks_left -= used
+
     def reduce_points(self, min_distance: float) -> None:
         """
         Reduces the number of points in the track. Segment points will be
@@ -2018,6 +2234,20 @@ class GPX:
         """
         for track in self.tracks:
             track.simplify(max_distance=max_distance)
+
+    def simplify_time_aware(self, max_distance: float, anchors: Optional[Iterable[GPXTrackPoint]]=None,
+                            max_checks: Optional[int]=None) -> None:
+        """
+        Replay-oriented simplification of every track, see
+        GPXTrackSegment.simplify_time_aware. Tracks and segments are
+        simplified independently, so compression never crosses their
+        boundaries. max_checks limits the total work over all tracks.
+        """
+        anchor_ids, checks_left = _time_aware_simplify_params(anchors, max_checks)
+        for track in self.tracks:
+            for segment in track.segments:
+                segment.points, used = _simplify_time_aware_points(segment.points, max_distance, anchor_ids, checks_left)
+                checks_left -= used
 
     def reduce_points(self, max_points_no: Optional[float]=None, min_distance: Optional[float]=None) -> None:
         """
