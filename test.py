@@ -42,6 +42,7 @@ import gpxpy as mod_gpxpy
 import gpxpy.gpx as mod_gpx
 import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
+import gpxpy.mapmatch as mod_mapmatch
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
 
@@ -3705,6 +3706,153 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+    def _parallel_roads_graph(self, with_connector: bool=True) -> mod_mapmatch.RoadGraph:
+        """
+        Two parallel one-way roads 20 meters apart: the south road goes east,
+        the north road goes west, and the only legal connection between them
+        is at the east end.
+        """
+        degree = mod_geo.ONE_DEGREE
+        graph = mod_mapmatch.RoadGraph()
+        graph.add_node('sw', 0.0, 0.0)
+        graph.add_node('se', 0.0, 1000.0 / degree)
+        graph.add_node('nw', 20.0 / degree, 0.0)
+        graph.add_node('ne', 20.0 / degree, 1000.0 / degree)
+        graph.add_edge('south_eastbound', 'sw', 'se',
+                       [(0.0, 0.0), (0.0, 1000.0 / degree)])
+        graph.add_edge('north_westbound', 'ne', 'nw',
+                       [(20.0 / degree, 1000.0 / degree), (20.0 / degree, 0.0)])
+        if with_connector:
+            graph.add_edge('connector', 'se', 'ne',
+                           [(0.0, 1000.0 / degree), (20.0 / degree, 1000.0 / degree)])
+        return graph
+
+    def _mm_point(self, x_meters: float, y_meters: float,
+                  time: Optional[mod_datetime.datetime]=None) -> mod_gpx.GPXTrackPoint:
+        degree = mod_geo.ONE_DEGREE
+        return mod_gpx.GPXTrackPoint(
+            latitude=y_meters / degree,
+            longitude=x_meters / degree,
+            time=time,
+        )
+
+    def test_mapmatch_parallel_roads_beats_pointwise_greedy(self) -> None:
+        graph = self._parallel_roads_graph()
+        matcher = mod_mapmatch.MapMatcher(graph, search_radius=30.0, max_candidates=4, gps_sigma=8.0)
+
+        observations: List[mod_gpx.GPXTrackPoint] = []
+        # Driving east on the south (eastbound, one-way) road. GPS noise pulls
+        # the middle fixes closer to the parallel north road:
+        noisy_ys = [2.0, -2.0, 3.0, 12.0, 13.0, 12.0, -3.0, 2.0, 1.0]
+        for index, x in enumerate(range(100, 1000, 100)):
+            observations.append(self._mm_point(float(x), noisy_ys[index]))
+        # U-turn through the only legal connection at the east end:
+        observations.append(self._mm_point(1000.0, 5.0))
+        observations.append(self._mm_point(1000.0, 15.0))
+        # Back west on the north (westbound, one-way) road:
+        for x in range(900, 0, -100):
+            observations.append(self._mm_point(float(x), 18.0))
+
+        result = matcher.match(observations)
+        edges = result.matched_edges
+
+        self.assertEqual({}, result.unmatched)
+        self.assertEqual({}, result.breaks)
+
+        # The noisy middle fixes stay on the south road: leaving it would
+        # require an illegal jump between the two one-way roads:
+        for index in (3, 4, 5):
+            self.assertEqual('south_eastbound', edges[index])
+        # ...whereas point-wise greedy matching snaps them to the north road:
+        for index in (3, 4, 5):
+            greedy = matcher.candidates(observations[index].latitude,
+                                        observations[index].longitude)[0]
+            self.assertEqual('north_westbound', greedy.edge_id)
+
+        # The legal connection is used exactly where it exists:
+        self.assertEqual('connector', edges[9])
+        self.assertEqual('connector', edges[10])
+        self.assertEqual('north_westbound', edges[-1])
+
+        # Matched positions lie on the road polylines, in the middle of edges:
+        first_match = result.matches[0]
+        self.assertIsNotNone(first_match)
+        assert first_match is not None
+        self.assertAlmostEqual(0.0, first_match.latitude, places=6)
+        self.assertAlmostEqual(100.0, first_match.edge_offset, delta=1.0)
+        middle_match = result.matches[4]
+        self.assertIsNotNone(middle_match)
+        assert middle_match is not None
+        self.assertAlmostEqual(0.0, middle_match.latitude, places=6)
+
+    def test_mapmatch_max_candidates_one_equals_greedy(self) -> None:
+        graph = self._parallel_roads_graph()
+        # The caller controls the candidate limit; with a single candidate per
+        # observation the matcher degenerates to point-wise greedy matching:
+        matcher = mod_mapmatch.MapMatcher(graph, search_radius=30.0, max_candidates=1, gps_sigma=8.0)
+        observations = [self._mm_point(float(x), y)
+                        for x, y in ((100, 2), (200, -2), (300, 3), (400, 12),
+                                     (500, 13), (600, 12), (700, -3))]
+        result = matcher.match(observations)
+        edges = result.matched_edges
+        for index in (3, 4, 5):
+            self.assertEqual('north_westbound', edges[index])
+        # The illegal jumps between the two one-way roads break the sequence
+        # instead of being connected with a fake straight line:
+        self.assertEqual(mod_mapmatch.BreakReason.NO_FEASIBLE_CONNECTION, result.breaks[4])
+        self.assertEqual(mod_mapmatch.BreakReason.NO_FEASIBLE_CONNECTION, result.breaks[6])
+
+    def test_mapmatch_unmatched_observation_reported(self) -> None:
+        graph = self._parallel_roads_graph()
+        matcher = mod_mapmatch.MapMatcher(graph, search_radius=30.0)
+        observations = [
+            self._mm_point(100.0, 2.0),
+            self._mm_point(200.0, 1.0),
+            self._mm_point(500.0, 500.0),  # far away from every road
+            self._mm_point(300.0, 2.0),
+        ]
+        result = matcher.match(observations)
+        self.assertIsNone(result.matches[2])
+        self.assertEqual(mod_mapmatch.UnmatchedReason.NO_CANDIDATE_IN_RADIUS,
+                         result.unmatched[2])
+        self.assertEqual(mod_mapmatch.BreakReason.NO_CANDIDATE_IN_RADIUS,
+                         result.breaks[3])
+        self.assertEqual('south_eastbound', result.matched_edges[0])
+        self.assertEqual('south_eastbound', result.matched_edges[3])
+
+    def test_mapmatch_time_gap_breaks_sequence(self) -> None:
+        graph = self._parallel_roads_graph()
+        matcher = mod_mapmatch.MapMatcher(graph, search_radius=30.0,
+                                          max_time_gap_seconds=60.0)
+        start_time = mod_datetime.datetime(2020, 1, 1, 12, 0, 0)
+        observations = [
+            self._mm_point(100.0, 2.0, start_time),
+            self._mm_point(200.0, 1.0, start_time + mod_datetime.timedelta(seconds=10)),
+            # One hour later, far ahead -- no fake route across the gap:
+            self._mm_point(800.0, 2.0, start_time + mod_datetime.timedelta(hours=1)),
+            self._mm_point(900.0, 1.0, start_time + mod_datetime.timedelta(hours=1, seconds=10)),
+        ]
+        result = matcher.match(observations)
+        self.assertEqual(mod_mapmatch.BreakReason.TIME_GAP, result.breaks[2])
+        self.assertEqual(['south_eastbound'] * 4, result.matched_edges)
+
+    def test_mapmatch_no_feasible_connection_not_faked(self) -> None:
+        # Same two one-way roads but without the connecting edge:
+        graph = self._parallel_roads_graph(with_connector=False)
+        matcher = mod_mapmatch.MapMatcher(graph, search_radius=30.0)
+        observations = [
+            self._mm_point(100.0, 2.0),
+            self._mm_point(200.0, 1.0),
+            # Teleport to the disconnected parallel road:
+            self._mm_point(200.0, 19.0),
+            self._mm_point(100.0, 18.0),
+        ]
+        result = matcher.match(observations)
+        self.assertEqual(mod_mapmatch.BreakReason.NO_FEASIBLE_CONNECTION,
+                         result.breaks[2])
+        self.assertEqual('south_eastbound', result.matched_edges[1])
+        self.assertEqual('north_westbound', result.matched_edges[2])
+        self.assertEqual('north_westbound', result.matched_edges[3])
 
 if __name__ == '__main__':
     mod_unittest.main()

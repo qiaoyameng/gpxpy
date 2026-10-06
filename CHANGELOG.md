@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Offline map matching to a caller-supplied directed road graph (`gpxpy.mapmatch`): HMM/Viterbi sequence matching with per-observation projection candidates, legal network routes (one-way aware, mid-edge candidates), time-gap and no-feasible-connection breaks, and unmatched reasons
+
 ## v1.6.1
 
 - Minor fix
