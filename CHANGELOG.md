@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Offline map matching to a caller-provided directed road graph (`gpxpy.mapmatching`)
+
 ## v1.6.1
 
 - Minor fix

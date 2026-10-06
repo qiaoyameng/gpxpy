@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.mapmatching as mod_mapmatching
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -150,6 +151,21 @@ def print_etree(e1: Any, indent: str='') -> str:
     for subelem in e1:
         tag.append(print_etree(subelem, indent+'__|'))
     return ''.join(tag)
+
+
+def make_parallel_roads_graph(with_connector: bool=True) -> mod_mapmatching.RoadGraph:
+    """
+    Two parallel one-way (eastbound) roads about 33m apart, plus an optional
+    directed connector from the east end of road A back to the start of
+    road B. Used to prove that whole-sequence matching differs from
+    point-wise greedy matching.
+    """
+    graph = mod_mapmatching.RoadGraph()
+    graph.add_edge('A', 'A0', 'A1', [(0.0, 0.0), (0.0, 0.01)])
+    graph.add_edge('B', 'B0', 'B1', [(-0.0003, 0.0), (-0.0003, 0.01)])
+    if with_connector:
+        graph.add_edge('connector', 'A1', 'B0', [(0.0, 0.01), (-0.0003, 0.01), (-0.0003, 0.0)])
+    return graph
 
 
 class GPXTests(mod_unittest.TestCase):
@@ -3705,6 +3721,181 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    def test_map_matching_parallel_roads_not_greedy(self) -> None:
+        # True track is on road B driving east, but GPS noise pulls the
+        # middle points closer to the parallel road A. Point-wise greedy
+        # matching snaps them to A; the HMM matcher must keep them on B
+        # because there is no legal route from B to A.
+        graph = make_parallel_roads_graph()
+        matcher = mod_mapmatching.MapMatcher(graph, gps_sigma=15.0, transition_beta=30.0)
+        observations = []
+        for i in range(7):
+            longitude = 0.002 + 0.001 * i
+            latitude = -0.0003 if i < 2 or i > 4 else -0.0001
+            observations.append(mod_mapmatching.Observation(latitude=latitude, longitude=longitude))
+
+        result = matcher.match(observations)
+
+        greedy_edges = []
+        for observation in observations:
+            candidates = matcher.get_candidates(observation.latitude, observation.longitude)
+            greedy_edges.append(min(candidates, key=lambda candidate: candidate.distance).edge_id)
+        self.assertTrue('A' in greedy_edges)
+
+        self.assertTrue(all(point.matched for point in result.points))
+        self.assertEqual(['B'], result.matched_edges)
+        self.assertNotEqual(greedy_edges, [point.edge_id for point in result.points])
+        for point in result.points:
+            self.assertAlmostEqual(-0.0003, point.latitude, places=6)  # type: ignore
+
+    def test_map_matching_follows_legal_connector(self) -> None:
+        # The track really leaves road A through the connector and continues
+        # on road B: the matcher must use the connector edge instead of
+        # jumping directly between the parallel roads.
+        graph = make_parallel_roads_graph()
+        matcher = mod_mapmatching.MapMatcher(graph, gps_sigma=15.0, transition_beta=30.0)
+        observations = [
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.006),
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.0095),
+            mod_mapmatching.Observation(latitude=-0.00015, longitude=0.01),
+            mod_mapmatching.Observation(latitude=-0.0003, longitude=0.007),
+            mod_mapmatching.Observation(latitude=-0.0003, longitude=0.004),
+            mod_mapmatching.Observation(latitude=-0.0003, longitude=0.001),
+            mod_mapmatching.Observation(latitude=-0.0003, longitude=0.003),
+        ]
+
+        result = matcher.match(observations)
+
+        self.assertTrue(all(point.matched for point in result.points))
+        self.assertEqual(['A', 'connector', 'B'], result.matched_edges)
+        self.assertEqual('A', result.points[0].edge_id)
+        self.assertEqual('A', result.points[1].edge_id)
+        self.assertEqual('connector', result.points[2].edge_id)
+        self.assertEqual('connector', result.points[3].edge_id)
+        self.assertEqual('connector', result.points[4].edge_id)
+        self.assertEqual('B', result.points[6].edge_id)
+
+    def test_map_matching_no_legal_route_reported_not_faked(self) -> None:
+        # Two parallel roads with no connection at all: when the track
+        # teleports from A to B, the first point on B cannot be reached by a
+        # legal route and must be reported unmatched instead of being
+        # connected with a fake straight line.
+        graph = mod_mapmatching.RoadGraph()
+        graph.add_edge('A', 'A0', 'A1', [(0.0, 0.0), (0.0, 0.01)])
+        graph.add_edge('B', 'B0', 'B1', [(-0.001, 0.0), (-0.001, 0.01)])
+        matcher = mod_mapmatching.MapMatcher(graph, max_candidate_distance=50.0)
+        observations = [
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.002),
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.003),
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.004),
+            mod_mapmatching.Observation(latitude=-0.001, longitude=0.005),
+            mod_mapmatching.Observation(latitude=-0.001, longitude=0.006),
+        ]
+
+        result = matcher.match(observations)
+
+        self.assertTrue(all(point.matched for point in result.points[:3]))
+        self.assertEqual(['A', 'A', 'A'], [point.edge_id for point in result.points[:3]])
+        self.assertFalse(result.points[3].matched)
+        self.assertEqual(mod_mapmatching.UnmatchedReason.NO_ROUTE, result.points[3].reason)
+        self.assertTrue(result.points[4].matched)
+        self.assertEqual('B', result.points[4].edge_id)
+        self.assertTrue(result.points[4].segment_break)
+
+    def test_map_matching_no_candidate(self) -> None:
+        graph = make_parallel_roads_graph()
+        matcher = mod_mapmatching.MapMatcher(graph, max_candidate_distance=50.0)
+        observations = [
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.005),
+            mod_mapmatching.Observation(latitude=0.01, longitude=0.005),
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.006),
+        ]
+
+        result = matcher.match(observations)
+
+        self.assertTrue(result.points[0].matched)
+        self.assertFalse(result.points[1].matched)
+        self.assertEqual(mod_mapmatching.UnmatchedReason.NO_CANDIDATE, result.points[1].reason)
+        self.assertTrue(result.points[2].matched)
+        self.assertTrue(result.points[2].segment_break)
+
+    def test_map_matching_one_way_direction(self) -> None:
+        # Driving west on an east-only road: the second point would require
+        # going backwards on a directed edge, so it cannot be matched.
+        graph = mod_mapmatching.RoadGraph()
+        graph.add_edge('one_way', 'N0', 'N1', [(0.0, 0.0), (0.0, 0.01)])
+        matcher = mod_mapmatching.MapMatcher(graph)
+        observations = [
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.006),
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.005),
+        ]
+
+        result = matcher.match(observations)
+
+        self.assertTrue(result.points[0].matched)
+        self.assertFalse(result.points[1].matched)
+        self.assertEqual(mod_mapmatching.UnmatchedReason.NO_ROUTE, result.points[1].reason)
+
+    def test_map_matching_time_gap_starts_new_segment(self) -> None:
+        graph = mod_mapmatching.RoadGraph()
+        graph.add_edge('road', 'N0', 'N1', [(0.0, 0.0), (0.0, 0.01)])
+        matcher = mod_mapmatching.MapMatcher(graph, max_time_gap=60.0)
+        start = mod_datetime.datetime(2024, 1, 1, 12, 0, 0)
+        observations = [
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.002, time=start),
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.003,
+                                        time=start + mod_datetime.timedelta(seconds=10)),
+            mod_mapmatching.Observation(latitude=0.0, longitude=0.004,
+                                        time=start + mod_datetime.timedelta(seconds=3610)),
+        ]
+
+        result = matcher.match(observations)
+
+        self.assertTrue(all(point.matched for point in result.points))
+        self.assertFalse(result.points[0].segment_break)
+        self.assertFalse(result.points[1].segment_break)
+        self.assertTrue(result.points[2].segment_break)
+
+    def test_map_matching_candidate_limits(self) -> None:
+        graph = make_parallel_roads_graph()
+        matcher = mod_mapmatching.MapMatcher(graph, max_candidate_distance=50.0, max_candidates=1)
+        candidates = matcher.get_candidates(-0.0001, 0.005)
+        self.assertEqual(1, len(candidates))
+        self.assertEqual('A', candidates[0].edge_id)
+
+        matcher = mod_mapmatching.MapMatcher(graph, max_candidate_distance=50.0, max_candidates=8)
+        # Roads A and B plus the connector segment running along B's latitude
+        self.assertEqual(3, len(matcher.get_candidates(-0.0001, 0.005)))
+
+        matcher = mod_mapmatching.MapMatcher(graph, max_candidate_distance=10.0)
+        self.assertEqual([], matcher.get_candidates(-0.0001, 0.005))
+
+    def test_road_graph_directed_shortest_path(self) -> None:
+        graph = make_parallel_roads_graph()
+        path = graph.shortest_path('A0', 'B1')
+        self.assertIsNotNone(path)
+        self.assertEqual(['A', 'connector', 'B'], path[1])  # type: ignore
+        self.assertEqual((0.0, []), graph.shortest_path('A0', 'A0'))
+        # One-way: no route back from road B to road A
+        self.assertIsNone(graph.shortest_path('B0', 'A0'))
+
+    def test_map_matching_from_gpx_track_points(self) -> None:
+        graph = mod_mapmatching.RoadGraph()
+        graph.add_edge('road', 'N0', 'N1', [(0.0, 0.0), (0.0, 0.01)])
+        matcher = mod_mapmatching.MapMatcher(graph)
+        start = mod_datetime.datetime(2024, 1, 1, 12, 0, 0)
+        points = [
+            mod_gpx.GPXTrackPoint(latitude=0.0, longitude=0.002, time=start),
+            mod_gpx.GPXTrackPoint(latitude=0.0, longitude=0.003,
+                                  time=start + mod_datetime.timedelta(seconds=10)),
+        ]
+
+        result = matcher.match(mod_mapmatching.observations_from_points(points))
+
+        self.assertEqual(2, len(result.points))
+        self.assertTrue(all(point.matched for point in result.points))
+        self.assertEqual(['road'], result.matched_edges)
 
 if __name__ == '__main__':
     mod_unittest.main()

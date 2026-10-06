@@ -81,6 +81,28 @@ gpx.py preserves GPX extensions. They are stored as [ElementTree](https://docs.p
 
 The GPX version is automatically determined when parsing by reading the version attribute in the gpx node. If this attribute is not present then the version is assumed to be 1.0. A specific version can be forced by setting the `version` parameter in the parse function. Possible values for the 'version' parameter are `1.0`, `1.1` and `None`.
 
+## Offline map matching
+
+`gpxpy.mapmatching` matches GPS observations to a small, caller-provided road network (a directed graph with a polyline per edge) without any online map service. For every observation it finds a limited set of projection candidates on nearby edges and then computes the best candidate sequence for the whole track (Hidden-Markov-Model / Viterbi), taking into account both the GPS distance error and the legal road-network travel distance between consecutive candidates. One-way streets, candidates in the middle of an edge and large time gaps are handled, and points that cannot be connected by a legal route are reported as unmatched (with a reason) instead of being connected by a fake straight line:
+
+```python
+import gpxpy.mapmatching as mod_mapmatching
+
+graph = mod_mapmatching.RoadGraph()
+graph.add_edge('main_st', 'n0', 'n1', [(45.0, 14.0), (45.0, 14.01)])
+graph.add_edge('side_st', 'n1', 'n2', [(45.0, 14.01), (45.001, 14.01)])
+
+matcher = mod_mapmatching.MapMatcher(graph, max_candidate_distance=50.0, max_candidates=5)
+result = matcher.match(mod_mapmatching.observations_from_points(gpx_segment.points))
+for point in result.points:
+    if point.matched:
+        print(point.edge_id, point.latitude, point.longitude)
+    else:
+        print('unmatched:', point.reason)
+```
+
+The graph size and the candidate limits (`max_candidate_distance`, `max_candidates`) are controlled by the caller.
+
 ## GPX max speed
 
 Gpxpy is a GPX parser and by using it you have access to all the data from the original GPX file. The additional methods to calculate stats have some additional heuristics to remove common GPS errors. For example, to calculate `max_speed` it removes the top `5%` of speeds and points with nonstandard distance (those are usually GPS errors).
@@ -119,4 +141,3 @@ pip install gpx-cmd-tools
 ## License
 
 GPX.py is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
-
