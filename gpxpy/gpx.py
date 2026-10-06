@@ -132,6 +132,23 @@ class NearestLocationData(NamedTuple):  # this is also what walk() returns/itera
     track_no: int
     segment_no: int
     point_no: int
+class NearestPolylineData(NamedTuple):
+    """
+    Result of a nearest-polyline-position query: the projection of a location
+    on the track polyline (not just on its sample points).
+    """
+    location: mod_geo.Location
+    """ The projected position on the polyline. """
+    track_no: int
+    segment_no: int
+    edge_no: int
+    """ Index of the edge (i.e. of its start point) within the segment. """
+    fraction: float
+    """ Position along the edge: 0.0 = edge start point, 1.0 = edge end point. """
+    distance_from_segment_start: float
+    """ Distance in meters along the segment from its start to the projected position. """
+    distance: float
+    """ Distance in meters between the query location and the projected position. """
 class PointData(NamedTuple):
     point: "GPXTrackPoint"
     distance_from_start: float
@@ -146,6 +163,52 @@ class GPXException(Exception):
     valid but something is wrong with the GPX data.
     """
     pass
+
+
+def _scan_segment_nearest_polyline(
+        location: mod_geo.Location,
+        segment: "GPXTrackSegment",
+        track_no: int,
+        segment_no: int,
+        max_distance: Optional[float],
+        best: Optional[NearestPolylineData],
+        best_key: Optional[Tuple[float, int, int, int]],
+        ) -> Tuple[Optional[NearestPolylineData], Optional[Tuple[float, int, int, int]]]:
+    """
+    Full-scan nearest-polyline query over the edges of a single segment.
+
+    Candidates are compared with the (distance, track_no, segment_no,
+    edge_no) key so that equally distant candidates are resolved stably in
+    original track order. Edges follow the spherical short arc between
+    consecutive points.
+    """
+    points = segment.points or []
+    distance_from_start = 0.0
+    for edge_no in range(len(points) - 1):
+        point_1 = points[edge_no]
+        point_2 = points[edge_no + 1]
+        edge_length = mod_geo.haversine_distance(
+                point_1.latitude, point_1.longitude, point_2.latitude, point_2.longitude)
+        try:
+            latitude, longitude, fraction, distance = mod_geo.nearest_point_on_great_circle_arc(
+                    location.latitude, location.longitude,
+                    point_1.latitude, point_1.longitude,
+                    point_2.latitude, point_2.longitude)
+        except ValueError as e:
+            raise GPXException(
+                    f'Cannot compute nearest polyline location: {e} '
+                    f'(track_no={track_no}, segment_no={segment_no}, edge_no={edge_no})')
+        if max_distance is None or distance <= max_distance:
+            key = (distance, track_no, segment_no, edge_no)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = NearestPolylineData(
+                        mod_geo.Location(latitude, longitude),
+                        track_no, segment_no, edge_no, fraction,
+                        distance_from_start + fraction * edge_length,
+                        distance)
+        distance_from_start += edge_length
+    return best, best_key
 
 
 class GPXBounds:
@@ -1225,6 +1288,19 @@ class GPXTrackSegment:
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
 
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      max_distance: Optional[float]=None) -> Optional[NearestPolylineData]:
+        """
+        Return the nearest position on this segment's polyline (the spherical
+        short arcs between consecutive points), or None if the segment has no
+        edges or no position is within ``max_distance`` meters.
+
+        Unlike get_nearest_location() (which only considers sample points),
+        the result may lie anywhere along an edge. See NearestPolylineData.
+        """
+        best, _ = _scan_segment_nearest_polyline(location, self, -1, -1, max_distance, None, None)
+        return best
+
     def smooth(self, vertical: bool=True, horizontal: bool=False, remove_extremes: bool=False) -> None:
         """ "Smooths" the elevation graph. Can be called multiple times. """
         if len(self.points) <= 3:
@@ -1902,7 +1978,23 @@ class GPXTrack:
         return min((NearestLocationData(pt, -1, seg, pt_no) for (pt, seg, pt_no) in self.walk()) # type: ignore
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
-        
+
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      max_distance: Optional[float]=None) -> Optional[NearestPolylineData]:
+        """
+        Return the nearest position on this track's polyline (the spherical
+        short arcs between consecutive points), or None if the track has no
+        edges or no position is within ``max_distance`` meters.
+
+        Equally distant candidates are resolved stably in segment/edge order.
+        """
+        best: Optional[NearestPolylineData] = None
+        best_key: Optional[Tuple[float, int, int, int]] = None
+        for segment_no, segment in enumerate(self.segments or []):
+            best, best_key = _scan_segment_nearest_polyline(
+                    location, segment, -1, segment_no, max_distance, best, best_key)
+        return best
+
     def clone(self) -> "GPXTrack":
         return mod_copy.deepcopy(self)
 
@@ -2519,6 +2611,36 @@ class GPX:
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
 
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      max_distance: Optional[float]=None) -> Optional[NearestPolylineData]:
+        """
+        Return the nearest position on the track polylines of this GPX (the
+        spherical short arcs between consecutive points), or None if there
+        are no edges or no position is within ``max_distance`` meters.
+
+        Unlike get_nearest_location() (which only considers sample points),
+        the result may lie anywhere along an edge. Equally distant candidates
+        are resolved stably in track/segment/edge order.
+
+        For repeated queries against the same GPX use GPXPolylineIndex, which
+        returns identical results without a full scan per query.
+        """
+        best: Optional[NearestPolylineData] = None
+        best_key: Optional[Tuple[float, int, int, int]] = None
+        for track_no, track in enumerate(self.tracks or []):
+            for segment_no, segment in enumerate(track.segments or []):
+                best, best_key = _scan_segment_nearest_polyline(
+                        location, segment, track_no, segment_no, max_distance, best, best_key)
+        return best
+
+    def get_polyline_index(self) -> "GPXPolylineIndex":
+        """
+        Build a reusable GPXPolylineIndex for nearest-polyline queries on
+        this GPX. See GPXPolylineIndex for the invalidation rules when the
+        GPX is changed after the index was built.
+        """
+        return GPXPolylineIndex(self)
+
     def add_elevation(self, delta: float) -> None:
         """
         Adjusts elevation data of GPX data.
@@ -2749,3 +2871,248 @@ for var_name in dir():
     if hasattr(var_value, 'gpx_10_fields') or hasattr(var_value, 'gpx_11_fields'):
         #print('Check/fill %s' % var_value)
         mod_gpxfield.gpx_check_slots_and_default_values(var_value)
+
+
+def _longitude_angular_distance(longitude_1: float, longitude_2: float) -> float:
+    """ Absolute angular distance (degrees, 0..180) between two longitudes. """
+    return abs((longitude_1 - longitude_2 + 180.0) % 360.0 - 180.0)
+
+
+class _PolylineEdgeInfo(NamedTuple):
+    """ Precomputed data for a single track-polyline edge in GPXPolylineIndex. """
+    track_no: int
+    segment_no: int
+    edge_no: int
+    latitude_1: float
+    longitude_1: float
+    latitude_2: float
+    longitude_2: float
+    length: float
+    distance_from_segment_start: float
+
+
+class GPXPolylineIndex:
+    """
+    A reusable spatial index for nearest-polyline-position queries on the
+    tracks of a GPX object.
+
+    Build once and query many times::
+
+        index = GPXPolylineIndex(gpx)
+        index.get_nearest_polyline_location(location)
+
+    Results are identical to GPX.get_nearest_polyline_location(), which does
+    a full scan and can be used as a reference for small inputs.
+
+    Invalidation rules
+    ------------------
+    The index snapshots the track geometry when built (or rebuilt):
+
+    * Structural changes -- tracks, segments or points added or removed --
+      are detected on every query through a fingerprint and raise
+      GPXException.
+    * In-place changes of existing point coordinates are NOT detected.
+
+    After either kind of change, call rebuild() (or build a new index)
+    before querying again.
+    """
+
+    MAX_CELLS_PER_EDGE = 64
+    """ Edges spanning more grid cells than this are kept in an overflow list. """
+
+    def __init__(self, gpx: GPX) -> None:
+        self.gpx = gpx
+        """ The GPX this index is built from (kept to detect later changes). """
+        self._edges: List[_PolylineEdgeInfo] = []
+        self._overflow: List[int] = []
+        self._grid: Dict[Tuple[int, int], List[int]] = {}
+        self._n_lat = 0
+        self._n_lon = 0
+        self._cell_height = 0.0
+        self._cell_width = 0.0
+        self._fingerprint: Tuple[Any, ...] = ()
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        """ (Re)build the index from the current state of the GPX object. """
+        edges: List[_PolylineEdgeInfo] = []
+        min_latitude, max_latitude = mod_math.inf, -mod_math.inf
+        min_longitude, max_longitude = mod_math.inf, -mod_math.inf
+        for track_no, track in enumerate(self.gpx.tracks or []):
+            for segment_no, segment in enumerate(track.segments or []):
+                points = segment.points or []
+                distance_from_start = 0.0
+                for edge_no in range(len(points) - 1):
+                    point_1 = points[edge_no]
+                    point_2 = points[edge_no + 1]
+                    length = mod_geo.haversine_distance(
+                            point_1.latitude, point_1.longitude,
+                            point_2.latitude, point_2.longitude)
+                    edges.append(_PolylineEdgeInfo(
+                            track_no, segment_no, edge_no,
+                            point_1.latitude, point_1.longitude,
+                            point_2.latitude, point_2.longitude,
+                            length, distance_from_start))
+                    min_latitude = min(min_latitude, point_1.latitude, point_2.latitude)
+                    max_latitude = max(max_latitude, point_1.latitude, point_2.latitude)
+                    min_longitude = min(min_longitude, point_1.longitude, point_2.longitude)
+                    max_longitude = max(max_longitude, point_1.longitude, point_2.longitude)
+                    distance_from_start += length
+        self._edges = edges
+        if edges:
+            # Size the grid cells so that a cell contains a handful of edges:
+            target_cells = max(1.0, len(edges) / 16.0)
+            lat_span = max(max_latitude - min_latitude, 1e-6)
+            lon_span = max(max_longitude - min_longitude, 1e-6)
+            cell_degrees = min(5.0, max(0.001, mod_math.sqrt(lat_span * lon_span / target_cells)))
+        else:
+            cell_degrees = 0.1
+        self._n_lon = max(1, int(mod_math.ceil(360.0 / cell_degrees)))
+        self._n_lat = max(1, int(mod_math.ceil(180.0 / cell_degrees)))
+        self._cell_width = 360.0 / self._n_lon
+        self._cell_height = 180.0 / self._n_lat
+        self._overflow = []
+        self._grid = {}
+        for edge_index, edge in enumerate(edges):
+            self._insert_edge(edge_index, edge)
+        self._fingerprint = self._compute_fingerprint()
+
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      max_distance: Optional[float]=None) -> Optional[NearestPolylineData]:
+        """
+        Return the nearest position on the indexed track polylines, or None
+        if there are no edges or no position is within ``max_distance``
+        meters. The result is identical to a full scan with
+        GPX.get_nearest_polyline_location().
+
+        Raises GPXException if the GPX structure changed after this index
+        was built (see the class docstring for the invalidation rules).
+        """
+        self._check_fresh()
+        if not self._edges:
+            return None
+        best: Optional[NearestPolylineData] = None
+        best_key: Optional[Tuple[float, int, int, int]] = None
+        for edge_index in self._overflow:
+            best, best_key = self._consider(edge_index, location, max_distance, best, best_key)
+        # Visit occupied cells ordered by their distance lower bound; once the
+        # lower bound of the remaining cells exceeds the best distance found
+        # (or max_distance), no unvisited cell can improve the result:
+        threshold = max_distance if max_distance is not None else mod_math.inf
+        if best is not None:
+            threshold = min(threshold, best.distance)
+        bounded_cells: List[Tuple[float, Tuple[int, int]]] = []
+        for cell in self._grid:
+            lower_bound = self._cell_distance_lower_bound(location, cell)
+            if lower_bound <= threshold:
+                bounded_cells.append((lower_bound, cell))
+        bounded_cells.sort()
+        for lower_bound, cell in bounded_cells:
+            if lower_bound > threshold:
+                break
+            for edge_index in self._grid[cell]:
+                best, best_key = self._consider(edge_index, location, max_distance, best, best_key)
+            if best is not None:
+                threshold = min(max_distance if max_distance is not None else mod_math.inf,
+                                best.distance)
+        return best
+
+    def _compute_fingerprint(self) -> Tuple[Any, ...]:
+        return tuple(
+                (id(track), tuple((id(segment), len(segment.points or [])) for segment in track.segments or []))
+                for track in self.gpx.tracks or [])
+
+    def _check_fresh(self) -> None:
+        if self._compute_fingerprint() != self._fingerprint:
+            raise GPXException(
+                    'The GPX tracks changed after this GPXPolylineIndex was built; '
+                    'call rebuild() or create a new index before querying '
+                    '(see the GPXPolylineIndex docstring for the invalidation rules)')
+
+    def _latitude_cell(self, latitude: float) -> int:
+        return min(self._n_lat - 1, max(0, int((latitude + 90.0) / self._cell_height)))
+
+    def _longitude_cell(self, longitude: float) -> int:
+        return min(self._n_lon - 1, int(((longitude + 180.0) % 360.0) / self._cell_width))
+
+    def _insert_edge(self, edge_index: int, edge: _PolylineEdgeInfo) -> None:
+        try:
+            min_latitude, max_latitude = mod_geo.great_circle_arc_latitude_range(
+                    edge.latitude_1, edge.longitude_1, edge.latitude_2, edge.longitude_2)
+        except ValueError as e:
+            raise GPXException(
+                    f'Cannot build polyline index: {e} '
+                    f'(track_no={edge.track_no}, segment_no={edge.segment_no}, edge_no={edge.edge_no})')
+        longitude_delta = (edge.longitude_2 - edge.longitude_1 + 180.0) % 360.0 - 180.0
+        if abs(longitude_delta) > 90.0:
+            # Very long edge (its arc may pass near a pole, so its longitude
+            # range is not the endpoint range): always checked directly.
+            self._overflow.append(edge_index)
+            return
+        longitude_2_unwrapped = edge.longitude_1 + longitude_delta
+        min_longitude = min(edge.longitude_1, longitude_2_unwrapped)
+        max_longitude = max(edge.longitude_1, longitude_2_unwrapped)
+        lat_cell_1 = self._latitude_cell(min_latitude)
+        lat_cell_2 = self._latitude_cell(max_latitude)
+        lon_cell_1 = self._longitude_cell(min_longitude)
+        lon_cell_2 = self._longitude_cell(max_longitude)
+        n_lon_cells = (lon_cell_2 - lon_cell_1) % self._n_lon + 1
+        if (lat_cell_2 - lat_cell_1 + 1) * n_lon_cells > self.MAX_CELLS_PER_EDGE:
+            self._overflow.append(edge_index)
+            return
+        for lat_cell in range(lat_cell_1, lat_cell_2 + 1):
+            lon_cell = lon_cell_1
+            for _ in range(n_lon_cells):
+                self._grid.setdefault((lat_cell, lon_cell), []).append(edge_index)
+                lon_cell = (lon_cell + 1) % self._n_lon
+
+    def _consider(self, edge_index: int, location: mod_geo.Location,
+                  max_distance: Optional[float],
+                  best: Optional[NearestPolylineData],
+                  best_key: Optional[Tuple[float, int, int, int]],
+                  ) -> Tuple[Optional[NearestPolylineData], Optional[Tuple[float, int, int, int]]]:
+        edge = self._edges[edge_index]
+        try:
+            latitude, longitude, fraction, distance = mod_geo.nearest_point_on_great_circle_arc(
+                    location.latitude, location.longitude,
+                    edge.latitude_1, edge.longitude_1, edge.latitude_2, edge.longitude_2)
+        except ValueError as e:
+            raise GPXException(
+                    f'Cannot compute nearest polyline location: {e} '
+                    f'(track_no={edge.track_no}, segment_no={edge.segment_no}, edge_no={edge.edge_no})')
+        if max_distance is not None and distance > max_distance:
+            return best, best_key
+        key = (distance, edge.track_no, edge.segment_no, edge.edge_no)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = NearestPolylineData(
+                    mod_geo.Location(latitude, longitude),
+                    edge.track_no, edge.segment_no, edge.edge_no, fraction,
+                    edge.distance_from_segment_start + fraction * edge.length,
+                    distance)
+        return best, best_key
+
+    def _cell_distance_lower_bound(self, location: mod_geo.Location, cell: Tuple[int, int]) -> float:
+        """
+        Conservative lower bound (meters) of the distance between ``location``
+        and any point inside the given grid cell.
+        """
+        lat_cell, lon_cell = cell
+        min_latitude = -90.0 + lat_cell * self._cell_height
+        max_latitude = min_latitude + self._cell_height
+        min_longitude = -180.0 + lon_cell * self._cell_width
+        max_longitude = min_longitude + self._cell_width
+        delta_lat = max(0.0, min_latitude - location.latitude, location.latitude - max_latitude)
+        query_longitude = (location.longitude + 180.0) % 360.0 - 180.0
+        if min_longitude <= query_longitude <= max_longitude:
+            delta_lon = 0.0
+        else:
+            delta_lon = min(_longitude_angular_distance(query_longitude, min_longitude),
+                            _longitude_angular_distance(query_longitude, max_longitude))
+        # The east/west component of a great-circle distance is scaled down
+        # by the cosine of the most extreme latitude involved:
+        max_abs_latitude = max(abs(location.latitude), abs(min_latitude), abs(max_latitude))
+        lon_bound = 2.0 * mod_math.asin(min(1.0,
+                mod_math.cos(mod_math.radians(max_abs_latitude))
+                * mod_math.sin(mod_math.radians(delta_lon) / 2.0)))
+        return mod_geo.EARTH_RADIUS * max(mod_math.radians(delta_lat), lon_bound)

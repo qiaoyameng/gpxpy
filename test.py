@@ -425,6 +425,230 @@ class GPXTests(mod_unittest.TestCase):
         gpx.tracks = None # type: ignore
         self.assertTrue( gpx.get_nearest_location(mod_geo.Location(1, 1)) is None)
         
+    def make_polyline_gpx(self, tracks_points: List[List[List[Tuple[float, float]]]]) -> mod_gpx.GPX:
+        gpx = mod_gpx.GPX()
+        for track_points in tracks_points:
+            track = mod_gpx.GPXTrack()
+            for segment_points in track_points:
+                segment = mod_gpx.GPXTrackSegment()
+                segment.points = [mod_gpx.GPXTrackPoint(latitude=lat, longitude=lon) for (lat, lon) in segment_points]
+                track.segments.append(segment)
+            gpx.tracks.append(track)
+        return gpx
+
+    def assert_polyline_data_equal(self, expected: Optional[mod_gpx.NearestPolylineData],
+                                   actual: Optional[mod_gpx.NearestPolylineData]) -> None:
+        if expected is None or actual is None:
+            self.assertEqual(expected, actual)
+            return
+        self.assertAlmostEqual(expected.location.latitude, actual.location.latitude)
+        self.assertAlmostEqual(expected.location.longitude, actual.location.longitude)
+        self.assertEqual(expected.track_no, actual.track_no)
+        self.assertEqual(expected.segment_no, actual.segment_no)
+        self.assertEqual(expected.edge_no, actual.edge_no)
+        self.assertAlmostEqual(expected.fraction, actual.fraction)
+        self.assertAlmostEqual(expected.distance_from_segment_start, actual.distance_from_segment_start)
+        self.assertAlmostEqual(expected.distance, actual.distance)
+
+    def test_nearest_polyline_location_long_edge_midpoint(self) -> None:
+        # An event exactly in the middle of a long edge must project on the
+        # edge (distance ~0), not fall back to the nearest sample point:
+        gpx = self.make_polyline_gpx([[[(0.0, 0.0), (0.0, 1.0)]]])
+        location = mod_geo.Location(0.0, 0.5)
+        result = gpx.get_nearest_polyline_location(location)
+        assert result is not None
+        self.assertEqual((result.track_no, result.segment_no, result.edge_no), (0, 0, 0))
+        self.assertAlmostEqual(result.distance, 0.0, places=6)
+        self.assertAlmostEqual(result.fraction, 0.5, places=9)
+        self.assertAlmostEqual(result.location.latitude, 0.0, places=9)
+        self.assertAlmostEqual(result.location.longitude, 0.5, places=9)
+        edge_length = mod_geo.haversine_distance(0.0, 0.0, 0.0, 1.0)
+        self.assertAlmostEqual(result.distance_from_segment_start, edge_length / 2.0, places=6)
+        # The old sample-point-based query is ~55 km off for the same event:
+        nearest_point = gpx.get_nearest_location(location)
+        self.assertTrue(nearest_point is not None)
+        point_distance = nearest_point.location.distance_2d(location)  # type: ignore
+        self.assertTrue(point_distance is not None and point_distance > 50000)
+
+    def test_nearest_polyline_location_distance_from_segment_start(self) -> None:
+        gpx = self.make_polyline_gpx([[[(0.0, 0.0), (0.0, 1.0), (0.0, 2.0), (1.0, 2.0)]]])
+        result = gpx.get_nearest_polyline_location(mod_geo.Location(0.0, 1.5))
+        assert result is not None
+        self.assertEqual(result.edge_no, 1)
+        self.assertAlmostEqual(result.fraction, 0.5, places=9)
+        edge_1 = mod_geo.haversine_distance(0.0, 0.0, 0.0, 1.0)
+        edge_2 = mod_geo.haversine_distance(0.0, 1.0, 0.0, 2.0)
+        self.assertAlmostEqual(result.distance_from_segment_start, edge_1 + edge_2 / 2.0, places=6)
+        # A query beyond the last point projects on the last edge's end point:
+        result = gpx.get_nearest_polyline_location(mod_geo.Location(2.0, 2.0))
+        assert result is not None
+        self.assertEqual(result.edge_no, 2)
+        self.assertAlmostEqual(result.fraction, 1.0, places=9)
+        edge_3 = mod_geo.haversine_distance(0.0, 2.0, 1.0, 2.0)
+        self.assertAlmostEqual(result.distance_from_segment_start, edge_1 + edge_2 + edge_3, places=6)
+
+    def test_nearest_polyline_location_track_and_segment(self) -> None:
+        gpx = self.make_polyline_gpx([
+            [[(0.0, 0.0), (1.0, 0.0)]],
+            [[(10.0, 10.0), (11.0, 10.0)], [(20.0, 20.0), (21.0, 20.0)]],
+        ])
+        segment_result = gpx.tracks[1].segments[0].get_nearest_polyline_location(mod_geo.Location(10.5, 10.0))
+        assert segment_result is not None
+        self.assertEqual((segment_result.track_no, segment_result.segment_no), (-1, -1))
+        self.assertAlmostEqual(segment_result.distance, 0.0, places=6)
+        track_result = gpx.tracks[1].get_nearest_polyline_location(mod_geo.Location(20.5, 20.0))
+        assert track_result is not None
+        self.assertEqual((track_result.track_no, track_result.segment_no), (-1, 1))
+        self.assertAlmostEqual(track_result.distance, 0.0, places=6)
+        # Segments with too few points have no polyline edges:
+        empty_segment = mod_gpx.GPXTrackSegment()
+        self.assertTrue(empty_segment.get_nearest_polyline_location(mod_geo.Location(0.0, 0.0)) is None)
+        single_point_segment = mod_gpx.GPXTrackSegment(points=[mod_gpx.GPXTrackPoint(latitude=0.0, longitude=0.0)])
+        self.assertTrue(single_point_segment.get_nearest_polyline_location(mod_geo.Location(0.0, 0.0)) is None)
+
+    def test_nearest_polyline_location_degenerate_edge(self) -> None:
+        # Zero-length edges (duplicated consecutive points) are treated as
+        # single points:
+        gpx = self.make_polyline_gpx([[[(1.0, 1.0), (1.0, 1.0), (2.0, 2.0)]]])
+        result = gpx.get_nearest_polyline_location(mod_geo.Location(1.0, 1.0))
+        assert result is not None
+        self.assertAlmostEqual(result.distance, 0.0, places=9)
+        self.assertEqual(result.edge_no, 0)
+        self.assertAlmostEqual(result.fraction, 0.0, places=9)
+        self.assertAlmostEqual(result.distance_from_segment_start, 0.0, places=9)
+
+    def test_nearest_polyline_location_dateline(self) -> None:
+        gpx = self.make_polyline_gpx([[[(10.0, 179.0), (10.0, -179.0)]]])
+        result = gpx.get_nearest_polyline_location(mod_geo.Location(10.0, 180.0))
+        assert result is not None
+        # The short arc crosses the antimeridian; the projection is near
+        # (10.0015, +/-180), much closer than both endpoints (~110 km away):
+        self.assertTrue(result.distance < 1000.0)
+        self.assertAlmostEqual(result.fraction, 0.5, places=6)
+        self.assertAlmostEqual(abs(result.location.longitude), 180.0, places=6)
+        endpoint_distance = mod_geo.haversine_distance(10.0, 180.0, 10.0, 179.0)
+        self.assertTrue(result.distance < endpoint_distance / 100.0)
+
+    def test_nearest_polyline_location_near_poles(self) -> None:
+        # The short arc between two points at 85N bulges beyond both
+        # endpoints' latitudes; a query at the arc's highest latitude must
+        # project on the arc interior, not on an endpoint:
+        gpx = self.make_polyline_gpx([[[(85.0, 0.0), (85.0, 90.0)]]])
+        min_latitude, max_latitude = mod_geo.great_circle_arc_latitude_range(85.0, 0.0, 85.0, 90.0)
+        self.assertTrue(min_latitude == 85.0)
+        self.assertTrue(max_latitude > 86.0)
+        result = gpx.get_nearest_polyline_location(mod_geo.Location(max_latitude, 45.0))
+        assert result is not None
+        self.assertAlmostEqual(result.distance, 0.0, places=3)
+        self.assertAlmostEqual(result.fraction, 0.5, places=6)
+        self.assertTrue(result.location.latitude > 85.0)
+
+    def test_nearest_polyline_location_antipodal_edge_rejected(self) -> None:
+        # Exactly antipodal endpoints have no unique short arc -> explicit
+        # rejection, both for the full scan and when building the index:
+        gpx = self.make_polyline_gpx([[[(0.0, 0.0), (0.0, 180.0)]]])
+        self.assertRaises(mod_gpx.GPXException, gpx.get_nearest_polyline_location, mod_geo.Location(10.0, 90.0))
+        self.assertRaises(mod_gpx.GPXException, mod_gpx.GPXPolylineIndex, gpx)
+
+    def test_nearest_polyline_location_tie_stable_order(self) -> None:
+        # Identical edges in different tracks/segments: the candidate first
+        # in original track order wins, for both the scan and the index:
+        gpx = self.make_polyline_gpx([
+            [[(0.0, 0.0), (0.0, 1.0)], [(0.0, 0.0), (0.0, 1.0)]],
+            [[(0.0, 0.0), (0.0, 1.0)]],
+        ])
+        index = gpx.get_polyline_index()
+        for result in (gpx.get_nearest_polyline_location(mod_geo.Location(0.0, 0.5)),
+                       index.get_nearest_polyline_location(mod_geo.Location(0.0, 0.5))):
+            assert result is not None
+            self.assertEqual((result.track_no, result.segment_no, result.edge_no), (0, 0, 0))
+            self.assertAlmostEqual(result.distance, 0.0, places=9)
+
+    def test_nearest_polyline_location_max_distance(self) -> None:
+        gpx = self.make_polyline_gpx([[[(0.0, 0.0), (0.0, 1.0)]]])
+        index = gpx.get_polyline_index()
+        far_location = mod_geo.Location(1.0, 0.5)  # ~111 km from the edge
+        for query in (gpx.get_nearest_polyline_location, index.get_nearest_polyline_location):
+            self.assertTrue(query(far_location, max_distance=1000.0) is None)
+            result = query(far_location, max_distance=200000.0)
+            assert result is not None
+            self.assertAlmostEqual(result.distance, mod_geo.haversine_distance(1.0, 0.5, 0.0, 0.5), places=6)
+            self.assertTrue(query(far_location) is not None)
+        # No edges at all -> None:
+        empty_gpx = mod_gpx.GPX()
+        self.assertTrue(empty_gpx.get_nearest_polyline_location(far_location) is None)
+        self.assertTrue(empty_gpx.get_polyline_index().get_nearest_polyline_location(far_location) is None)
+
+    def test_nearest_polyline_index_matches_full_scan(self) -> None:
+        random = mod_random.Random(20161005)
+        tracks: List[List[List[Tuple[float, float]]]] = []
+        for _ in range(3):
+            segments: List[List[Tuple[float, float]]] = []
+            for _ in range(2):
+                lat, lon = random.uniform(-60.0, 60.0), random.uniform(-180.0, 180.0)
+                points: List[Tuple[float, float]] = []
+                for _ in range(30):
+                    points.append((lat, lon))
+                    lat += random.uniform(-0.05, 0.05)
+                    lon += random.uniform(-0.05, 0.05)
+                segments.append(points)
+            tracks.append(segments)
+        # Edges exercising the special cases (long edges, antimeridian
+        # crossing, near-polar bulge, degenerate edge):
+        tracks.append([
+            [(0.0, 0.0), (0.0, 30.0)],
+            [(10.0, 170.0), (10.0, -170.0)],
+            [(80.0, 0.0), (80.0, 60.0)],
+            [(5.0, 5.0), (5.0, 5.0), (6.0, 6.0)],
+            [(0.0, 0.0), (0.0, 120.0)],
+        ])
+        gpx = self.make_polyline_gpx(tracks)
+        index = gpx.get_polyline_index()
+        locations = [mod_geo.Location(random.uniform(-70.0, 70.0), random.uniform(-180.0, 180.0))
+                     for _ in range(100)]
+        locations += [
+            mod_geo.Location(0.0, 15.0),   # on the long equator edge
+            mod_geo.Location(10.0, 180.0), # antimeridian crossing
+            mod_geo.Location(83.0, 30.0),  # near the polar segment
+            mod_geo.Location(5.0, 5.0),    # degenerate edge
+            mod_geo.Location(0.0, 60.0),   # very long edge
+        ]
+        for location in locations:
+            for max_distance in (None, 10000.0, 1000000.0):
+                expected = gpx.get_nearest_polyline_location(location, max_distance=max_distance)
+                actual = index.get_nearest_polyline_location(location, max_distance=max_distance)
+                self.assert_polyline_data_equal(expected, actual)
+
+    def test_nearest_polyline_index_matches_scan_on_real_file(self) -> None:
+        gpx = self.parse('korita-zbevnica.gpx')
+        index = gpx.get_polyline_index()
+        for lat, lon in ((45.45, 14.03), (45.5, 14.0), (45.0, 14.5), (0.0, 0.0)):
+            location = mod_geo.Location(lat, lon)
+            for max_distance in (None, 100.0, 100000.0):
+                expected = gpx.get_nearest_polyline_location(location, max_distance=max_distance)
+                actual = index.get_nearest_polyline_location(location, max_distance=max_distance)
+                self.assert_polyline_data_equal(expected, actual)
+
+    def test_nearest_polyline_index_invalidation(self) -> None:
+        gpx = self.make_polyline_gpx([[[(0.0, 0.0), (0.0, 1.0)]]])
+        index = gpx.get_polyline_index()
+        location = mod_geo.Location(0.0, 0.5)
+        self.assertTrue(index.get_nearest_polyline_location(location) is not None)
+        # Structural changes are detected on the next query:
+        gpx.tracks[0].segments[0].points.append(mod_gpx.GPXTrackPoint(latitude=0.0, longitude=2.0))
+        self.assertRaises(mod_gpx.GPXException, index.get_nearest_polyline_location, location)
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        self.assertRaises(mod_gpx.GPXException, index.get_nearest_polyline_location, location)
+        # After rebuild() the index is usable again and sees the new geometry:
+        index.rebuild()
+        result = index.get_nearest_polyline_location(location)
+        assert result is not None
+        self.assertAlmostEqual(result.distance, 0.0, places=9)
+        result = index.get_nearest_polyline_location(mod_geo.Location(0.0, 1.5))
+        assert result is not None
+        self.assertEqual(result.edge_no, 1)
+        self.assertAlmostEqual(result.distance, 0.0, places=9)
+
     def test_long_timestamps(self) -> None:
         # Check if timestamps in format: 1901-12-13T20:45:52.2073437Z work
         gpx = self.parse('Mojstrovka.gpx')

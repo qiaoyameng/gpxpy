@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Nearest-polyline-position queries: `get_nearest_polyline_location(location, max_distance=None)` on `GPX`, `GPXTrack` and `GPXTrackSegment` projects a location on the track polyline (spherical short arcs between consecutive points) instead of only returning the nearest sample point. The result (`NearestPolylineData`) contains the track/segment/edge indexes, the fraction along the edge and the distance from the segment start. `GPXPolylineIndex` (or `gpx.get_polyline_index()`) provides a reusable spatial index returning identical results for repeated queries.
+
 ## v1.6.1
 
 - Minor fix

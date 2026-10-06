@@ -359,6 +359,187 @@ def simplify_polyline(points: List["Location"], max_distance: Optional[float]) -
             simplify_polyline(points[tmp_max_distance_position:], _max_distance)[1:])
 
 
+# --- Nearest point on a great-circle arc ------------------------------------
+#
+# The following functions work with 3d unit vectors instead of raw
+# latitude/longitude pairs. That makes them robust around the antimeridian
+# (longitude wrap-around) and in near-polar regions where longitude degrees
+# are strongly compressed.
+
+Vector3 = Tuple[float, float, float]
+
+ARC_ENDPOINT_EPSILON: float = 1e-12
+"""
+If the norm of the cross product of the two endpoint unit vectors of a
+great-circle arc is smaller than this, the endpoints are considered identical
+(a degenerate, zero-length arc) or antipodal (no unique short arc exists).
+"""
+
+
+def _lat_lon_to_vector(latitude: float, longitude: float) -> Vector3:
+    lat = mod_math.radians(latitude)
+    lon = mod_math.radians(longitude)
+    cos_lat = mod_math.cos(lat)
+    return (cos_lat * mod_math.cos(lon), cos_lat * mod_math.sin(lon), mod_math.sin(lat))
+
+
+def _vector_to_lat_lon(vector: Vector3) -> Tuple[float, float]:
+    x, y, z = vector
+    return (mod_math.degrees(mod_math.asin(max(-1.0, min(1.0, z)))),
+            mod_math.degrees(mod_math.atan2(y, x)))
+
+
+def _cross_product(u: Vector3, v: Vector3) -> Vector3:
+    return (u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0])
+
+
+def _dot_product(u: Vector3, v: Vector3) -> float:
+    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+
+
+def _vector_norm(u: Vector3) -> float:
+    return mod_math.sqrt(_dot_product(u, u))
+
+
+def _central_angle(u: Vector3, v: Vector3) -> float:
+    """ Angle (radians) between two unit vectors, robust for small angles. """
+    return mod_math.atan2(_vector_norm(_cross_product(u, v)), _dot_product(u, v))
+
+
+def _arc_normal(vector_1: Vector3, vector_2: Vector3) -> Vector3:
+    """
+    Normalized normal vector of the great circle through two unit vectors.
+
+    Raises ValueError for antipodal points (no unique great circle) and returns
+    the zero vector for (nearly) identical points.
+    """
+    normal = _cross_product(vector_1, vector_2)
+    normal_norm = _vector_norm(normal)
+    if normal_norm < ARC_ENDPOINT_EPSILON:
+        if _dot_product(vector_1, vector_2) < 0:
+            raise ValueError('Antipodal arc endpoints: no unique short great-circle arc')
+        return (0.0, 0.0, 0.0)
+    return (normal[0] / normal_norm, normal[1] / normal_norm, normal[2] / normal_norm)
+
+
+def _is_on_arc(vector_1: Vector3, vector_2: Vector3, normal: Vector3, vector: Vector3) -> bool:
+    """
+    True if ``vector`` (a unit vector on the great circle defined with
+    ``normal``) lies on the short arc between ``vector_1`` and ``vector_2``.
+    """
+    return _dot_product(_cross_product(vector_1, vector), normal) >= 0 \
+        and _dot_product(_cross_product(vector, vector_2), normal) >= 0
+
+
+def nearest_point_on_great_circle_arc(latitude: float, longitude: float,
+                                      latitude_1: float, longitude_1: float,
+                                      latitude_2: float, longitude_2: float) -> Tuple[float, float, float, float]:
+    """
+    Project a point on the short great-circle arc between two endpoints.
+
+    Parameters
+    ----------
+    latitude, longitude: float
+        The query point.
+    latitude_1, longitude_1, latitude_2, longitude_2: float
+        The arc endpoints.
+
+    Returns
+    ----------
+    result: tuple
+        (latitude, longitude, fraction, distance) of the nearest point on the
+        arc. ``fraction`` is the position along the arc (0.0 = first endpoint,
+        1.0 = second endpoint) and ``distance`` is the distance in meters
+        between the query point and the nearest point on the arc.
+
+    Degenerate (zero-length) arcs are treated as a single point. Antipodal
+    endpoints have no unique short arc and raise ValueError.
+    """
+    query = _lat_lon_to_vector(latitude, longitude)
+    vector_1 = _lat_lon_to_vector(latitude_1, longitude_1)
+    vector_2 = _lat_lon_to_vector(latitude_2, longitude_2)
+
+    normal = _arc_normal(vector_1, vector_2)
+
+    if normal == (0.0, 0.0, 0.0):
+        # Degenerate arc: both endpoints are (nearly) the same point:
+        return latitude_1, longitude_1, 0.0, EARTH_RADIUS * _central_angle(query, vector_1)
+
+    arc_angle = _central_angle(vector_1, vector_2)
+
+    # Project the query vector on the great-circle plane:
+    dot = _dot_product(query, normal)
+    projected = (query[0] - dot * normal[0],
+                 query[1] - dot * normal[1],
+                 query[2] - dot * normal[2])
+    projected_norm = _vector_norm(projected)
+
+    if projected_norm >= ARC_ENDPOINT_EPSILON:
+        projected = (projected[0] / projected_norm,
+                     projected[1] / projected_norm,
+                     projected[2] / projected_norm)
+        if _is_on_arc(vector_1, vector_2, normal, projected):
+            result_latitude, result_longitude = _vector_to_lat_lon(projected)
+            fraction = _central_angle(vector_1, projected) / arc_angle
+            distance = EARTH_RADIUS * _central_angle(query, projected)
+            return result_latitude, result_longitude, fraction, distance
+
+    # The projection falls outside the arc (or the query point is the pole of
+    # the great circle, in which case every arc point is equally distant):
+    # the nearest arc point is one of the two endpoints.
+    angle_1 = _central_angle(query, vector_1)
+    angle_2 = _central_angle(query, vector_2)
+    if angle_1 <= angle_2:
+        return latitude_1, longitude_1, 0.0, EARTH_RADIUS * angle_1
+    return latitude_2, longitude_2, 1.0, EARTH_RADIUS * angle_2
+
+
+def great_circle_arc_latitude_range(latitude_1: float, longitude_1: float,
+                                    latitude_2: float, longitude_2: float) -> Tuple[float, float]:
+    """
+    The (min_latitude, max_latitude) spanned by the short great-circle arc
+    between the two given endpoints.
+
+    Note that a great-circle arc can reach latitudes beyond both of its
+    endpoints (the "vertex" of the great circle), so this is not simply the
+    range of the endpoint latitudes.
+
+    Raises ValueError for antipodal endpoints (no unique short arc).
+    """
+    vector_1 = _lat_lon_to_vector(latitude_1, longitude_1)
+    vector_2 = _lat_lon_to_vector(latitude_2, longitude_2)
+
+    normal = _arc_normal(vector_1, vector_2)
+
+    if normal == (0.0, 0.0, 0.0):
+        # Degenerate arc:
+        return latitude_1, latitude_1
+
+    min_latitude = min(latitude_1, latitude_2)
+    max_latitude = max(latitude_1, latitude_2)
+
+    # The points of the great circle with extreme latitudes are in the
+    # direction of (z_axis - (z_axis . normal) * normal):
+    z_dot_normal = normal[2]
+    vertex = (-z_dot_normal * normal[0],
+              -z_dot_normal * normal[1],
+              1.0 - z_dot_normal * normal[2])
+    vertex_norm = _vector_norm(vertex)
+
+    if vertex_norm >= ARC_ENDPOINT_EPSILON:
+        vertex = (vertex[0] / vertex_norm, vertex[1] / vertex_norm, vertex[2] / vertex_norm)
+        vertex_latitude = mod_math.degrees(mod_math.asin(max(-1.0, min(1.0, vertex[2]))))
+        if _is_on_arc(vector_1, vector_2, normal, vertex):
+            max_latitude = max(max_latitude, vertex_latitude)
+        opposite = (-vertex[0], -vertex[1], -vertex[2])
+        if _is_on_arc(vector_1, vector_2, normal, opposite):
+            min_latitude = min(min_latitude, -vertex_latitude)
+
+    return min_latitude, max_latitude
+
+
 class Location:
     """ Generic geographical location """
 
