@@ -140,6 +140,32 @@ class PointData(NamedTuple):
     point_no: int
 
 
+class NearestPolylineLocationData(NamedTuple):
+    location: "GPXTrackPoint"
+    track_no: int
+    segment_no: int
+    edge_no: int
+    edge_ratio: float
+    distance_from_segment_start: float
+    distance: float
+
+    @property
+    def edge_index(self) -> int:
+        return self.edge_no
+
+    @property
+    def segment_index(self) -> int:
+        return self.segment_no
+
+    @property
+    def ratio(self) -> float:
+        return self.edge_ratio
+
+    @property
+    def distance_from_start(self) -> float:
+        return self.distance_from_segment_start
+
+
 class GPXException(Exception):
     """
     Exception used for invalid GPX files. It is used when the XML file is
@@ -1225,6 +1251,26 @@ class GPXTrackSegment:
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
 
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      index: Optional["GPXPolylineIndex"] = None,
+                                      max_distance: Optional[float] = None) -> Optional[NearestPolylineLocationData]:
+        """ Return nearest point projected on this segment's spherical short arcs. """
+        if max_distance is not None and max_distance < 0:
+            raise ValueError('max_distance must not be negative')
+        if index is not None:
+            index._validate_for(self)
+            result = index.geo_index.find_nearest_location(location, max_distance)
+        else:
+            points: List[GPXTrackPoint] = self.points if self.points else []
+            result = mod_geo.nearest_location_on_polyline(points, location, max_distance)
+        if result is None:
+            return None
+        return NearestPolylineLocationData(
+            GPXTrackPoint(result.location.latitude, result.location.longitude),
+            -1, -1, result.edge_index, result.edge_ratio,
+            result.distance_from_polyline_start, result.distance,
+        )
+
     def smooth(self, vertical: bool=True, horizontal: bool=False, remove_extremes: bool=False) -> None:
         """ "Smooths" the elevation graph. Can be called multiple times. """
         if len(self.points) <= 3:
@@ -1902,10 +1948,30 @@ class GPXTrack:
         return min((NearestLocationData(pt, -1, seg, pt_no) for (pt, seg, pt_no) in self.walk()) # type: ignore
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
-        
+
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      index: Optional["GPXPolylineIndex"] = None,
+                                      max_distance: Optional[float] = None) -> Optional[NearestPolylineLocationData]:
+        """ Return nearest point projected on this track's spherical short arcs. """
+        if max_distance is not None and max_distance < 0:
+            raise ValueError('max_distance must not be negative')
+        if index is not None:
+            index._validate_for(self)
+            result = index.geo_index.find_nearest_location(location, max_distance)
+        else:
+            polylines: List[List[GPXTrackPoint]] = [segment.points if segment.points else []
+                                                    for segment in self.segments]
+            result = mod_geo.nearest_location_on_polylines(polylines, location, max_distance)
+        if result is None:
+            return None
+        return NearestPolylineLocationData(
+            GPXTrackPoint(result.location.latitude, result.location.longitude),
+            -1, result.polyline_index, result.edge_index, result.edge_ratio,
+            result.distance_from_polyline_start, result.distance,
+        )
+
     def clone(self) -> "GPXTrack":
         return mod_copy.deepcopy(self)
-
 
     def __repr__(self) -> str:
         parts = []
@@ -2519,6 +2585,36 @@ class GPX:
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
 
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      index: Optional["GPXPolylineIndex"] = None,
+                                      max_distance: Optional[float] = None) -> Optional[NearestPolylineLocationData]:
+        """ Return nearest point projected on any track's spherical short arcs. """
+        if max_distance is not None and max_distance < 0:
+            raise ValueError('max_distance must not be negative')
+        if index is not None:
+            index._validate_for(self)
+            result = index.geo_index.find_nearest_location(location, max_distance)
+        else:
+            polylines = [segment.points if segment.points else []
+                         for track in self.tracks if track.segments
+                         for segment in track.segments]
+            result = mod_geo.nearest_location_on_polylines(polylines, location, max_distance)
+        if result is None:
+            return None
+        record = self._polyline_records()[result.polyline_index]
+        return NearestPolylineLocationData(
+            GPXTrackPoint(result.location.latitude, result.location.longitude),
+            record[0], record[1], result.edge_index, result.edge_ratio,
+            result.distance_from_polyline_start, result.distance,
+        )
+
+    def _polyline_records(self) -> List[Tuple[int, int]]:
+        records: List[Tuple[int, int]] = []
+        for track_no, track in enumerate(self.tracks if self.tracks else []):
+            for segment_no in range(len(track.segments if track.segments else [])):
+                records.append((track_no, segment_no))
+        return records
+
     def add_elevation(self, delta: float) -> None:
         """
         Adjusts elevation data of GPX data.
@@ -2742,6 +2838,92 @@ class GPX:
 
     def clone(self) -> "GPX":
         return mod_copy.deepcopy(self)
+
+
+class GPXPolylineIndex:
+    """
+    Reusable nearest-polyline index for a GPX object, track, or segment.
+
+    The index snapshots 2D geometry. Queries validate that snapshot unless
+    ``validate=False`` is passed. After mutating point coordinates or
+    collections, explicitly call :meth:`invalidate` or :meth:`rebuild`
+    before reusing the index.
+    """
+
+    __slots__ = ('source', 'records', 'geo_index', 'fingerprint', 'invalid')
+
+    def __init__(self, source: Union[GPXTrackSegment, GPXTrack, GPX]) -> None:
+        self.source = source
+        self.records: List[Tuple[int, int]] = []
+        self.geo_index: mod_geo.SphericalPolylineIndex
+        self.fingerprint: Tuple[Tuple[int, int, Tuple[Tuple[float, float], ...]], ...]
+        self.invalid = False
+        self.rebuild()
+
+    def _polylines(self) -> List[List[GPXTrackPoint]]:
+        if isinstance(self.source, GPXTrackSegment):
+            self.records = [(-1, -1)]
+            return [self.source.points or []]
+        if isinstance(self.source, GPXTrack):
+            self.records = [(-1, segment_no) for segment_no, _ in enumerate(self.source.segments)]
+            return [segment.points or [] for segment in self.source.segments]
+        self.records = []
+        polylines: List[List[GPXTrackPoint]] = []
+        for track_no, track in enumerate(self.source.tracks if self.source.tracks else []):
+            for segment_no, segment in enumerate(track.segments if track.segments else []):
+                self.records.append((track_no, segment_no))
+                polylines.append(segment.points or [])
+        return polylines
+
+    def _calculate_fingerprint(self) -> Tuple[Tuple[int, int, Tuple[Tuple[float, float], ...]], ...]:
+        return tuple(
+            (track_no, segment_no, tuple((point.latitude, point.longitude) for point in polyline))
+            for (track_no, segment_no), polyline in zip(self.records, self._polylines())
+        )
+
+    def rebuild(self) -> None:
+        polylines = self._polylines()
+        self.geo_index = mod_geo.SphericalPolylineIndex(polylines)
+        self.fingerprint = self._calculate_fingerprint()
+        self.invalid = False
+
+    def invalidate(self) -> None:
+        """ Mark this index invalid after changing its indexed trajectory. """
+        self.invalid = True
+
+    def is_valid(self) -> bool:
+        return not self.invalid and self._calculate_fingerprint() == self.fingerprint
+
+    def _validate_for(self, source: Union[GPXTrackSegment, GPXTrack, GPX]) -> None:
+        if source is not self.source:
+            raise ValueError('Polyline index was built for a different track or segment')
+        if self.invalid:
+            raise RuntimeError('Polyline index was explicitly invalidated; rebuild it before reuse')
+        if not self.is_valid():
+            raise RuntimeError('Polyline index is stale; rebuild or invalidate it after changing the track')
+
+    def find_nearest_location(self, location: mod_geo.Location,
+                              max_distance: Optional[float] = None,
+                              validate: bool = True) -> Optional[NearestPolylineLocationData]:
+        return self.get_nearest_polyline_location(location, max_distance=max_distance,
+                                                  validate=validate)
+
+    def get_nearest_polyline_location(self, location: mod_geo.Location,
+                                      max_distance: Optional[float] = None,
+                                      validate: bool = True) -> Optional[NearestPolylineLocationData]:
+        if self.invalid:
+            raise RuntimeError('Polyline index was explicitly invalidated; rebuild it before reuse')
+        if validate:
+            self._validate_for(self.source)
+        result = self.geo_index.find_nearest_location(location, max_distance)
+        if result is None:
+            return None
+        track_no, segment_no = self.records[result.polyline_index]
+        return NearestPolylineLocationData(
+            GPXTrackPoint(result.location.latitude, result.location.longitude),
+            track_no, segment_no, result.edge_index, result.edge_ratio,
+            result.distance_from_polyline_start, result.distance,
+        )
 
 # Add attributes and fill default values (lists or None) for all GPX elements:
 for var_name in dir():

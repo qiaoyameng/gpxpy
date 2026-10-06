@@ -39,6 +39,12 @@ This is a public, user-tunable knob. Assigning a new value to it changes the beh
 of :func:`distance` for the entire process.
 """
 
+_SPHERICAL_EPSILON: float = 1e-14
+_ANTIPODAL_EDGE_EPSILON: float = 1e-12
+_EQUAL_DISTANCE_EPSILON: float = 1e-12
+
+_SphericalVector = Tuple[float, float, float]
+
 def haversine_distance(latitude_1: float, longitude_1: float, latitude_2: float, longitude_2: float) -> float:
     """
     Haversine distance between two points, expressed in meters.
@@ -357,6 +363,282 @@ def simplify_polyline(points: List["Location"], max_distance: Optional[float]) -
     # function again using (begin to anchor) and (anchor to end), remove extra anchor
     return (simplify_polyline(points[:tmp_max_distance_position + 1], _max_distance) +
             simplify_polyline(points[tmp_max_distance_position:], _max_distance)[1:])
+
+
+class PolylineNearestLocation(NamedTuple):
+    location: "Location"
+    polyline_index: int
+    edge_index: int
+    edge_ratio: float
+    distance_from_polyline_start: float
+    distance: float
+
+    @property
+    def ratio(self) -> float:
+        return self.edge_ratio
+
+    @property
+    def distance_from_start(self) -> float:
+        return self.distance_from_polyline_start
+
+
+class _PolylineEdge(NamedTuple):
+    start: _SphericalVector
+    end: _SphericalVector
+    angular_length: float
+    length: float
+    distance_from_start: float
+    polyline_index: int
+    edge_index: int
+
+
+class _BoundingCap(NamedTuple):
+    center: _SphericalVector
+    radius: float
+
+
+class _BVHNode(NamedTuple):
+    cap: _BoundingCap
+    left: Optional["_BVHNode"]
+    right: Optional["_BVHNode"]
+    edge: Optional[_PolylineEdge]
+
+
+def _unit_vector(location: "Location") -> _SphericalVector:
+    latitude = mod_math.radians(location.latitude)
+    longitude = mod_math.radians(location.longitude)
+    cos_latitude = mod_math.cos(latitude)
+    return (
+        cos_latitude * mod_math.cos(longitude),
+        cos_latitude * mod_math.sin(longitude),
+        mod_math.sin(latitude),
+    )
+
+
+def _vector_dot(vector_1: _SphericalVector, vector_2: _SphericalVector) -> float:
+    return sum(value_1 * value_2 for value_1, value_2 in zip(vector_1, vector_2))
+
+
+def _vector_cross(vector_1: _SphericalVector, vector_2: _SphericalVector) -> _SphericalVector:
+    return (
+        vector_1[1] * vector_2[2] - vector_1[2] * vector_2[1],
+        vector_1[2] * vector_2[0] - vector_1[0] * vector_2[2],
+        vector_1[0] * vector_2[1] - vector_1[1] * vector_2[0],
+    )
+
+
+def _vector_norm(vector: Tuple[float, ...]) -> float:
+    return mod_math.sqrt(sum(value * value for value in vector))
+
+
+def _normalize_vector(vector: Tuple[float, ...]) -> _SphericalVector:
+    norm = _vector_norm(vector)
+    if norm <= _SPHERICAL_EPSILON:
+        raise ValueError('Cannot normalize a zero-length spherical vector')
+    return (vector[0] / norm, vector[1] / norm, vector[2] / norm)
+
+
+def _angular_distance(vector_1: _SphericalVector, vector_2: _SphericalVector) -> float:
+    cosine = min(1.0, max(-1.0, _vector_dot(vector_1, vector_2)))
+    sine_half = mod_math.sqrt(max(0.0, (1.0 - cosine) / 2.0))
+    cosine_half = mod_math.sqrt(max(0.0, (1.0 + cosine) / 2.0))
+    return 2.0 * mod_math.atan2(sine_half, cosine_half)
+
+
+def _vector_to_location(vector: _SphericalVector) -> "Location":
+    x, y, z = vector
+    return Location(mod_math.degrees(mod_math.atan2(z, mod_math.hypot(x, y))),
+                    mod_math.degrees(mod_math.atan2(y, x)))
+
+
+def _edge_cap(edge: _PolylineEdge) -> _BoundingCap:
+    if edge.angular_length <= _SPHERICAL_EPSILON:
+        return _BoundingCap(edge.start, 0.0)
+    center = _normalize_vector((
+        edge.start[0] + edge.end[0],
+        edge.start[1] + edge.end[1],
+        edge.start[2] + edge.end[2],
+    ))
+    return _BoundingCap(center, edge.angular_length / 2.0)
+
+
+def _combine_caps(cap_1: _BoundingCap, cap_2: _BoundingCap) -> _BoundingCap:
+    distance = _angular_distance(cap_1.center, cap_2.center)
+    if distance + cap_1.radius <= cap_2.radius + _SPHERICAL_EPSILON:
+        return cap_2
+    if distance + cap_2.radius <= cap_1.radius + _SPHERICAL_EPSILON:
+        return cap_1
+    return _BoundingCap(cap_1.center,
+                        min(mod_math.pi, max(cap_1.radius, distance + cap_2.radius)))
+
+
+def _build_edges(polylines: Sequence[Sequence["Location"]]) -> List[_PolylineEdge]:
+    edges: List[_PolylineEdge] = []
+    for polyline_index, points in enumerate(polylines):
+        distance_from_start = 0.0
+        previous_end: Optional[_SphericalVector] = None
+        edge_range = range(1) if len(points) == 1 else range(max(0, len(points) - 1))
+        for edge_index in edge_range:
+            point = points[edge_index]
+            start = _unit_vector(point)
+            end = _unit_vector(points[edge_index + 1]) if len(points) > 1 else start
+            angular_length = _angular_distance(start, end)
+            if mod_math.pi - angular_length < _ANTIPODAL_EDGE_EPSILON:
+                raise ValueError(f'Antipodal polyline edge {edge_index} has no unique shortest arc')
+            length = angular_length * EARTH_RADIUS
+            if previous_end is not None:
+                distance_from_start += _angular_distance(previous_end, start) * EARTH_RADIUS
+            edges.append(_PolylineEdge(start, end, angular_length, length,
+                                       distance_from_start, polyline_index, edge_index))
+            previous_end = end
+    return edges
+
+
+def _project_to_edge(location_vector: _SphericalVector, edge: _PolylineEdge) -> Tuple[_SphericalVector, float, float, float]:
+    if edge.angular_length <= _SPHERICAL_EPSILON:
+        distance = _angular_distance(location_vector, edge.start)
+        return edge.start, 0.0, edge.distance_from_start, distance * EARTH_RADIUS
+
+    sine_length = mod_math.sin(edge.angular_length)
+    cross = _vector_cross(edge.start, edge.end)
+    normal = _normalize_vector((
+        cross[0] / sine_length,
+        cross[1] / sine_length,
+        cross[2] / sine_length,
+    ))
+    tangent = _normalize_vector(tuple(
+        (edge.end[index] - edge.start[index] * mod_math.cos(edge.angular_length)) / sine_length
+        for index in range(3)
+    ))
+
+    along_axis = _vector_dot(location_vector, tangent)
+    across_axis = _vector_dot(location_vector, normal)
+    start_axis = _vector_dot(location_vector, edge.start)
+    along_angle = mod_math.atan2(along_axis, start_axis)
+    along_angle = min(max(along_angle, 0.0), edge.angular_length)
+
+    projected = _normalize_vector((
+        edge.start[0] * mod_math.cos(along_angle) + tangent[0] * mod_math.sin(along_angle),
+        edge.start[1] * mod_math.cos(along_angle) + tangent[1] * mod_math.sin(along_angle),
+        edge.start[2] * mod_math.cos(along_angle) + tangent[2] * mod_math.sin(along_angle),
+    ))
+    angular_distance = _angular_distance(location_vector, projected)
+    ratio = along_angle / edge.angular_length
+    distance_from_start = edge.distance_from_start + edge.length * ratio
+    return projected, ratio, distance_from_start, angular_distance * EARTH_RADIUS
+
+
+def _result_from_edge(location_vector: _SphericalVector, edge: _PolylineEdge) -> Tuple[PolylineNearestLocation, float]:
+    projected, ratio, distance_from_start, distance = _project_to_edge(location_vector, edge)
+    result = PolylineNearestLocation(
+        _vector_to_location(projected),
+        edge.polyline_index,
+        edge.edge_index,
+        ratio,
+        distance_from_start,
+        distance,
+    )
+    return result, distance / EARTH_RADIUS
+
+
+def _nearest_edge_scan(edges: List[_PolylineEdge], location_vector: _SphericalVector,
+                       max_distance: Optional[float]) -> Optional[PolylineNearestLocation]:
+    best_result: Optional[PolylineNearestLocation] = None
+    best_angular = mod_math.inf
+    for edge in edges:
+        result, angular_distance = _result_from_edge(location_vector, edge)
+        within_max_distance = max_distance is None or angular_distance * EARTH_RADIUS <= max_distance
+        if within_max_distance and angular_distance < best_angular - _EQUAL_DISTANCE_EPSILON:
+            best_result = result
+            best_angular = angular_distance
+    return best_result
+
+
+def nearest_location_on_polyline(points: Sequence["Location"], location: "Location",
+                                 max_distance: Optional[float] = None) -> Optional[PolylineNearestLocation]:
+    """
+    Find the nearest point on spherical great-circle segments of one polyline.
+    This is the reference full scan and builds no persistent index.
+    """
+    return nearest_location_on_polylines([points], location, max_distance)
+
+
+def nearest_location_on_polylines(polylines: Sequence[Sequence["Location"]], location: "Location",
+                                  max_distance: Optional[float] = None) -> Optional[PolylineNearestLocation]:
+    """ Reference full scan over spherical great-circle polyline edges. """
+    if max_distance is not None and max_distance < 0:
+        raise ValueError('max_distance must not be negative')
+    edges = _build_edges(polylines)
+    return _nearest_edge_scan(edges, _unit_vector(location), max_distance)
+
+
+class SphericalPolylineIndex:
+    """ Reusable BVH index for one or more spherical polylines. """
+
+    __slots__ = ('edges', 'root', 'polyline_count')
+
+    def __init__(self, polylines: Sequence[Sequence["Location"]]) -> None:
+        self.edges = _build_edges(polylines)
+        self.polyline_count = len(polylines)
+        self.root = self._build_node(self.edges) if self.edges else None
+
+    def _build_node(self, edges: List[_PolylineEdge]) -> _BVHNode:
+        if len(edges) == 1:
+            edge = edges[0]
+            return _BVHNode(_edge_cap(edge), None, None, edge)
+
+        middle = len(edges) // 2
+        left = self._build_node(edges[:middle])
+        right = self._build_node(edges[middle:])
+        return _BVHNode(_combine_caps(left.cap, right.cap), left, right, None)
+
+    def find_nearest_location(self, location: "Location",
+                              max_distance: Optional[float] = None) -> Optional[PolylineNearestLocation]:
+        if self.root is None:
+            return None
+        if max_distance is not None and max_distance < 0:
+            raise ValueError('max_distance must not be negative')
+
+        location_vector = _unit_vector(location)
+        best_angular = mod_math.inf
+        best_edge: Optional[_PolylineEdge] = None
+        best_projected: Optional[_SphericalVector] = None
+        best_ratio = 0.0
+        best_distance_from_start = 0.0
+
+        def search(node: _BVHNode) -> None:
+            nonlocal best_angular, best_edge, best_projected, best_ratio, best_distance_from_start
+            lower_bound = max(0.0, _angular_distance(location_vector, node.cap.center) - node.cap.radius)
+            if best_angular != mod_math.inf and lower_bound > best_angular + _EQUAL_DISTANCE_EPSILON:
+                return
+            if node.edge is not None:
+                projected, ratio, distance_from_start, distance = _project_to_edge(location_vector, node.edge)
+                angular_distance = distance / EARTH_RADIUS
+                if max_distance is not None and distance > max_distance:
+                    return
+                if angular_distance < best_angular - _EQUAL_DISTANCE_EPSILON:
+                    best_angular = angular_distance
+                    best_edge = node.edge
+                    best_projected = projected
+                    best_ratio = ratio
+                    best_distance_from_start = distance_from_start
+                return
+            if node.left is not None:
+                search(node.left)
+            if node.right is not None:
+                search(node.right)
+
+        search(self.root)
+        if best_edge is None or best_projected is None:
+            return None
+        return PolylineNearestLocation(
+            _vector_to_location(best_projected),
+            best_edge.polyline_index,
+            best_edge.edge_index,
+            best_ratio,
+            best_distance_from_start,
+            best_angular * EARTH_RADIUS,
+        )
 
 
 class Location:
