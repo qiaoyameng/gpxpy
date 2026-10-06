@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.clip as mod_clip
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3705,6 +3706,203 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    def test_clip_segment_through_rectangle_exact_intersections(self) -> None:
+        # Both endpoints are outside the rectangle, but the edge crosses it:
+        # point-wise filtering would lose this track entirely.
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        start = mod_datetime.datetime(2020, 1, 1, 12, 0, 0)
+        segment = mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=-1.0, elevation=0.0, time=start),
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=2.0, elevation=300.0,
+                                  time=start + mod_datetime.timedelta(hours=1)),
+        ])
+        clipped = mod_clip.clip_segment_to_polygon(segment, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000)
+        self.assertEqual(1, len(clipped))
+        points = clipped[0].points
+        self.assertEqual(2, len(points))
+        self.assertAlmostEqual(0.5, points[0].latitude)
+        self.assertAlmostEqual(0.0, points[0].longitude)
+        self.assertAlmostEqual(100.0, points[0].elevation)  # type: ignore
+        self.assertEqual(start + mod_datetime.timedelta(minutes=20), points[0].time)
+        self.assertAlmostEqual(0.5, points[1].latitude)
+        self.assertAlmostEqual(1.0, points[1].longitude)
+        self.assertAlmostEqual(200.0, points[1].elevation)  # type: ignore
+        self.assertEqual(start + mod_datetime.timedelta(minutes=40), points[1].time)
+
+    def test_clip_segment_along_rectangle_boundary(self) -> None:
+        # A track edge hugging the boundary is kept.
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        segment = mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=0.0, longitude=-1.0),
+            mod_gpx.GPXTrackPoint(latitude=0.0, longitude=2.0),
+        ])
+        clipped = mod_clip.clip_segment_to_polygon(segment, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000)
+        self.assertEqual(1, len(clipped))
+        points = clipped[0].points
+        self.assertEqual(2, len(points))
+        self.assertAlmostEqual(0.0, points[0].latitude)
+        self.assertAlmostEqual(0.0, points[0].longitude)
+        self.assertAlmostEqual(0.0, points[1].latitude)
+        self.assertAlmostEqual(1.0, points[1].longitude)
+
+    def test_clip_segment_through_rectangle_vertex(self) -> None:
+        # The track enters the rectangle exactly through its corner.
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        segment = mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=-1.0, longitude=-1.0),
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=0.5),
+        ])
+        clipped = mod_clip.clip_segment_to_polygon(segment, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000)
+        self.assertEqual(1, len(clipped))
+        points = clipped[0].points
+        self.assertEqual(2, len(points))
+        self.assertAlmostEqual(0.0, points[0].latitude)
+        self.assertAlmostEqual(0.0, points[0].longitude)
+        self.assertAlmostEqual(0.5, points[1].latitude)
+        self.assertAlmostEqual(0.5, points[1].longitude)
+
+    def test_clip_segment_tangent_vertex_touch_gives_nothing(self) -> None:
+        # The line passes exactly through the corner (0, 1) but stays outside.
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        segment = mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=-2.0, longitude=-1.0),
+            mod_gpx.GPXTrackPoint(latitude=1.0, longitude=2.0),
+        ])
+        clipped = mod_clip.clip_segment_to_polygon(segment, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000)
+        self.assertEqual(0, len(clipped))
+
+    def test_clip_segment_crossing_hole_splits_segments(self) -> None:
+        outer = [(0.0, 0.0), (0.0, 4.0), (4.0, 4.0), (4.0, 0.0)]
+        hole = [(1.5, 1.5), (1.5, 2.5), (2.5, 2.5), (2.5, 1.5)]
+        segment = mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=2.0, longitude=-1.0),
+            mod_gpx.GPXTrackPoint(latitude=2.0, longitude=5.0),
+        ])
+        clipped = mod_clip.clip_segment_to_polygon(segment, outer, holes=[hole], origin=(2.0, 2.0), max_span_m=1_000_000)
+        self.assertEqual(2, len(clipped))
+        first = clipped[0].points
+        second = clipped[1].points
+        self.assertEqual(2, len(first))
+        self.assertEqual(2, len(second))
+        self.assertAlmostEqual(0.0, first[0].longitude)
+        self.assertAlmostEqual(1.5, first[1].longitude)
+        self.assertAlmostEqual(2.5, second[0].longitude)
+        self.assertAlmostEqual(4.0, second[1].longitude)
+        for point in first + second:
+            self.assertAlmostEqual(2.0, point.latitude)
+
+    def test_clip_track_preserves_original_and_extensions(self) -> None:
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        extension = mod_etree.Element('heart_rate')
+        extension.text = '150'
+        inside_point = mod_gpx.GPXTrackPoint(latitude=0.5, longitude=0.5, elevation=0.0)
+        inside_point.extensions.append(extension)
+        track = mod_gpx.GPXTrack(name='track')
+        track.segments.append(mod_gpx.GPXTrackSegment(points=[
+            inside_point,
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=2.0, elevation=30.0),
+        ]))
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(track)
+        xml_before = gpx.to_xml()
+
+        clipped_track = mod_clip.clip_track_to_polygon(track, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000)
+
+        # The input GPX is not modified:
+        self.assertEqual(xml_before, gpx.to_xml())
+        self.assertEqual(1, len(track.segments))
+        self.assertEqual(2, len(track.segments[0].points))
+        self.assertEqual('track', clipped_track.name)
+        self.assertEqual(1, len(clipped_track.segments))
+        points = clipped_track.segments[0].points
+        self.assertEqual(2, len(points))
+        # Original point: deep copy, extensions preserved:
+        self.assertIsNot(points[0], inside_point)
+        self.assertEqual(1, len(points[0].extensions))
+        self.assertEqual('heart_rate', points[0].extensions[0].tag)
+        self.assertEqual('150', points[0].extensions[0].text)
+        # Synthesized boundary point: interpolated elevation, no invented data:
+        self.assertAlmostEqual(1.0, points[1].longitude)
+        self.assertAlmostEqual(10.0, points[1].elevation)  # type: ignore
+        self.assertEqual([], points[1].extensions)
+        self.assertIsNone(points[1].time)
+
+    def test_clip_track_splits_into_multiple_segments(self) -> None:
+        outer = [(0.0, 0.0), (0.0, 4.0), (4.0, 4.0), (4.0, 0.0)]
+        hole = [(1.5, 1.5), (1.5, 2.5), (2.5, 2.5), (2.5, 1.5)]
+        track = mod_gpx.GPXTrack(name='through')
+        track.segments.append(mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=2.0, longitude=-1.0),
+            mod_gpx.GPXTrackPoint(latitude=2.0, longitude=5.0),
+        ]))
+        clipped_track = mod_clip.clip_track_to_polygon(track, outer, holes=[hole], origin=(2.0, 2.0), max_span_m=1_000_000)
+        self.assertEqual('through', clipped_track.name)
+        self.assertEqual(2, len(clipped_track.segments))
+        # The original track is untouched:
+        self.assertEqual(1, len(track.segments))
+        self.assertEqual(2, len(track.segments[0].points))
+
+    def test_clip_single_point_segment(self) -> None:
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        inside = mod_gpx.GPXTrackSegment(points=[mod_gpx.GPXTrackPoint(latitude=0.5, longitude=0.5)])
+        clipped = mod_clip.clip_segment_to_polygon(inside, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000)
+        self.assertEqual(1, len(clipped))
+        self.assertEqual(1, len(clipped[0].points))
+        outside = mod_gpx.GPXTrackSegment(points=[mod_gpx.GPXTrackPoint(latitude=5.0, longitude=0.5)])
+        self.assertEqual([], mod_clip.clip_segment_to_polygon(outside, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000))
+
+    def test_clip_interpolates_only_available_data(self) -> None:
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        start = mod_datetime.datetime(2020, 1, 1, 12, 0, 0)
+        segment = mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=-1.0, elevation=0.0),
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=2.0, elevation=300.0,
+                                  time=start + mod_datetime.timedelta(hours=1)),
+        ])
+        clipped = mod_clip.clip_segment_to_polygon(segment, rectangle, origin=(0.5, 0.5), max_span_m=1_000_000)
+        self.assertEqual(1, len(clipped))
+        points = clipped[0].points
+        # Elevation is known on both endpoints, so it is interpolated...
+        self.assertAlmostEqual(100.0, points[0].elevation)  # type: ignore
+        # ...but time is missing on one endpoint, so it is not invented:
+        self.assertIsNone(points[0].time)
+        self.assertIsNone(points[1].time)
+
+    def test_clip_rejects_self_intersecting_polygon(self) -> None:
+        bowtie = [(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0)]
+        segment = mod_gpx.GPXTrackSegment(points=[mod_gpx.GPXTrackPoint(latitude=0.5, longitude=0.5)])
+        self.assertRaises(mod_clip.ClipError, mod_clip.clip_segment_to_polygon,
+                          segment, bowtie, origin=(0.5, 0.5), max_span_m=1_000_000)
+
+    def test_clip_rejects_invalid_hole(self) -> None:
+        outer = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        segment = mod_gpx.GPXTrackSegment(points=[mod_gpx.GPXTrackPoint(latitude=0.5, longitude=0.5)])
+        hole_outside = [(2.0, 2.0), (2.0, 3.0), (3.0, 3.0), (3.0, 2.0)]
+        self.assertRaises(mod_clip.ClipError, mod_clip.clip_segment_to_polygon,
+                          segment, outer, holes=[hole_outside], origin=(0.5, 0.5), max_span_m=1_000_000)
+        hole_crossing = [(0.5, 0.5), (0.5, 2.0), (2.0, 2.0), (2.0, 0.5)]
+        self.assertRaises(mod_clip.ClipError, mod_clip.clip_segment_to_polygon,
+                          segment, outer, holes=[hole_crossing], origin=(0.5, 0.5), max_span_m=1_000_000)
+
+    def test_clip_rejects_oversized_span(self) -> None:
+        rectangle = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]
+        segment = mod_gpx.GPXTrackSegment(points=[
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=0.5),
+            mod_gpx.GPXTrackPoint(latitude=0.5, longitude=5.0),
+        ])
+        # A track point ~500 km from the origin exceeds the default span:
+        self.assertRaises(mod_clip.ClipError, mod_clip.clip_segment_to_polygon,
+                          segment, rectangle, origin=(0.5, 0.5))
+        # A polygon vertex too far from the origin is rejected as well:
+        far_rectangle = [(0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 0.0)]
+        near_segment = mod_gpx.GPXTrackSegment(points=[mod_gpx.GPXTrackPoint(latitude=0.5, longitude=0.5)])
+        self.assertRaises(mod_clip.ClipError, mod_clip.clip_segment_to_polygon,
+                          near_segment, far_rectangle, origin=(0.5, 0.5))
+        # ...unless the caller explicitly accepts the larger span:
+        clipped = mod_clip.clip_segment_to_polygon(segment, rectangle, origin=(0.5, 0.5),
+                                                   max_span_m=1_000_000)
+        self.assertEqual(1, len(clipped))
 
 if __name__ == '__main__':
     mod_unittest.main()

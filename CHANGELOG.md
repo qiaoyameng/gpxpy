@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `gpxpy.clip` module: clip tracks against a polygon with optional holes in a local planar projection (explicit projection origin required), splitting the result into multiple segments
+
 ## v1.6.1
 
 - Minor fix
