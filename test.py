@@ -39,6 +39,7 @@ except ImportError:
     import xml.etree.ElementTree as mod_etree  # type: ignore
 
 import gpxpy as mod_gpxpy
+import gpxpy.clip as mod_clip
 import gpxpy.gpx as mod_gpx
 import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
@@ -3705,6 +3706,276 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    # ------------------------------------------------------------------
+    # Polygon clipping (gpxpy.clip)
+    # ------------------------------------------------------------------
+
+    def _clip_point(self, latitude: float, longitude: float,
+                    elevation: Optional[float] = None,
+                    time: Optional[mod_datetime.datetime] = None) -> mod_gpx.GPXTrackPoint:
+        return mod_gpx.GPXTrackPoint(latitude=latitude, longitude=longitude,
+                                     elevation=elevation, time=time)
+
+    def _rectangle_polygon(self) -> mod_clip.Polygon:
+        # Unit-degree square, counter-clockwise:
+        return mod_clip.Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+
+    def test_clip_segment_exact_line_rectangle_intersections(self) -> None:
+        """A horizontal segment crossing a rectangle: exact, axis-aligned cuts."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(0.5, -1.0, elevation=0.0,
+                             time=mod_datetime.datetime(2020, 1, 1, 0, 0, 0)),
+            self._clip_point(0.5, 2.0, elevation=300.0,
+                             time=mod_datetime.datetime(2020, 1, 1, 0, 3, 0)),
+        ])
+
+        result = segment.clip(polygon, projection)
+
+        self.assertEqual(1, len(result))
+        points = result[0].points
+        self.assertEqual(2, len(points))
+        # Exact intersections with the rectangle sides:
+        self.assertAlmostEqual(0.0, points[0].longitude, places=9)
+        self.assertAlmostEqual(1.0, points[1].longitude, places=9)
+        self.assertAlmostEqual(0.5, points[0].latitude, places=9)
+        self.assertAlmostEqual(0.5, points[1].latitude, places=9)
+        # Elevation interpolated by edge ratio 1/3 and 2/3:
+        self.assertAlmostEqual(100.0, points[0].elevation, places=6)
+        self.assertAlmostEqual(200.0, points[1].elevation, places=6)
+        # Time interpolated by the same ratio:
+        self.assertEqual(mod_datetime.datetime(2020, 1, 1, 0, 1, 0), points[0].time)
+        self.assertEqual(mod_datetime.datetime(2020, 1, 1, 0, 2, 0), points[1].time)
+
+    def test_clip_segment_out_in_out_splits_into_segments(self) -> None:
+        """'Ends outside, middle through the area' must not be lost."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(0.5, -1.0),
+            self._clip_point(0.5, 0.25),
+            self._clip_point(1.5, 0.5),
+            self._clip_point(0.5, 0.75),
+            self._clip_point(0.5, 2.0),
+        ])
+
+        result = segment.clip(polygon, projection)
+
+        self.assertEqual(2, len(result))
+        first = [(p.latitude, p.longitude) for p in result[0].points]
+        second = [(p.latitude, p.longitude) for p in result[1].points]
+        # First run: enter at lon=0 (lat=0.5), leave through the top edge at
+        # (lat=1, lon=0.375):
+        self.assertAlmostEqual(0.5, first[0][0], places=9)
+        self.assertAlmostEqual(0.0, first[0][1], places=9)
+        self.assertIn((0.5, 0.25), first)
+        self.assertAlmostEqual(1.0, first[-1][0], places=9)
+        self.assertAlmostEqual(0.375, first[-1][1], places=9)
+        # Second run: re-enter through the top edge at (lat=1, lon=0.625),
+        # leave at lon=1 (lat=0.5):
+        self.assertAlmostEqual(1.0, second[0][0], places=9)
+        self.assertAlmostEqual(0.625, second[0][1], places=9)
+        self.assertIn((0.5, 0.75), second)
+        self.assertAlmostEqual(0.5, second[-1][0], places=9)
+        self.assertAlmostEqual(1.0, second[-1][1], places=9)
+
+    def test_clip_segment_with_hole_splits_in_two(self) -> None:
+        """A central hole punches the portion into two separate segments."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = mod_clip.Polygon(
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            holes=[[(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)]])
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(0.5, -1.0),
+            self._clip_point(0.5, 2.0),
+        ])
+
+        result = segment.clip(polygon, projection)
+
+        self.assertEqual(2, len(result))
+        first = result[0].points
+        second = result[1].points
+        self.assertEqual([(round(p.latitude, 9), round(p.longitude, 9)) for p in first],
+                         [(0.5, 0.0), (0.5, 0.4)])
+        self.assertEqual([(round(p.latitude, 9), round(p.longitude, 9)) for p in second],
+                         [(0.5, 0.6), (0.5, 1.0)])
+
+    def test_clip_segment_along_boundary_is_kept(self) -> None:
+        """A path running exactly on the boundary belongs to the region."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(0.0, -0.5),
+            self._clip_point(0.0, 0.5),
+        ])
+
+        result = segment.clip(polygon, projection)
+
+        self.assertEqual(1, len(result))
+        points = result[0].points
+        self.assertEqual(2, len(points))
+        self.assertAlmostEqual(0.0, points[0].longitude, places=9)
+        self.assertAlmostEqual(0.5, points[1].longitude, places=9)
+
+    def test_clip_segment_along_hole_boundary_is_kept(self) -> None:
+        """Following the edge of a hole is kept (boundary is part of region)."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = mod_clip.Polygon(
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            holes=[[(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)]])
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(0.6, 0.4),
+            self._clip_point(0.6, 0.6),
+        ])
+
+        result = segment.clip(polygon, projection)
+
+        self.assertEqual(1, len(result))
+        self.assertEqual(2, len(result[0].points))
+
+    def test_clip_segment_touching_vertex_from_outside(self) -> None:
+        """Touching a single vertex from outside yields no usable segment."""
+        projection = mod_clip.LocalProjection(0.0, 0.0, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(-1.0, -1.0),
+            self._clip_point(-0.5, -0.5),
+        ])
+
+        result = segment.clip(polygon, projection)
+
+        self.assertEqual(0, len(result))
+
+    def test_clip_segment_entering_through_a_vertex(self) -> None:
+        """A diagonal line entering exactly via a corner keeps the inside part."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(-1.0, -1.0),
+            self._clip_point(2.0, 2.0),
+        ])
+
+        result = segment.clip(polygon, projection)
+
+        self.assertEqual(1, len(result))
+        points = result[0].points
+        self.assertAlmostEqual(0.0, points[0].latitude, places=9)
+        self.assertAlmostEqual(0.0, points[0].longitude, places=9)
+        self.assertAlmostEqual(1.0, points[-1].latitude, places=9)
+        self.assertAlmostEqual(1.0, points[-1].longitude, places=9)
+
+    def test_clip_preserves_extensions_of_original_points(self) -> None:
+        """Extensions on original points survive; new intersection points get none."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+
+        first = self._clip_point(0.5, 0.25)
+        extension = mod_etree.Element('{gpx.py}speed')
+        extension.text = '7.5'
+        first.extensions = [extension]
+
+        segment = mod_gpx.GPXTrackSegment([
+            self._clip_point(0.5, -1.0),
+            first,
+            self._clip_point(0.5, 2.0),
+        ])
+
+        result = segment.clip(polygon, projection)
+        self.assertEqual(1, len(result))
+        points = result[0].points
+        self.assertEqual(3, len(points))
+
+        # The freshly created intersection points must not carry fake data:
+        self.assertEqual([], points[0].extensions)
+        self.assertEqual([], points[2].extensions)
+        self.assertIsNone(points[0].speed)
+        # The original middle point keeps its extension object:
+        self.assertIs(first, points[1])
+        self.assertEqual(1, len(points[1].extensions))
+        self.assertTrue(elements_equal(points[1].extensions[0], extension))
+
+    def test_clip_does_not_modify_input_segment(self) -> None:
+        """The original GPX data must be untouched after clipping."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+        original = [self._clip_point(0.5, -1.0, elevation=10.0),
+                    self._clip_point(0.5, 0.5, elevation=20.0),
+                    self._clip_point(0.5, 2.0, elevation=30.0)]
+        segment = mod_gpx.GPXTrackSegment(list(original))
+
+        snapshot = mod_copy.deepcopy(segment)
+        segment.clip(polygon, projection)
+
+        self.assertEqual(3, len(segment.points))
+        for before, after in zip(snapshot.points, segment.points):
+            self.assertEqual(before.latitude, after.latitude)
+            self.assertEqual(before.longitude, after.longitude)
+            self.assertEqual(before.elevation, after.elevation)
+            self.assertIsNot(before, after)  # sanity: snapshot is independent
+
+    def test_clip_track_keeps_metadata_and_splits_segments(self) -> None:
+        """GPXTrack.clip returns a new track with preserved metadata."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = self._rectangle_polygon()
+        track = mod_gpx.GPXTrack(name='walk', description='d', number=3)
+        track.type = 'hike'
+        track.segments.append(mod_gpx.GPXTrackSegment([
+            self._clip_point(0.5, -1.0),
+            self._clip_point(0.5, 2.0),
+        ]))
+
+        clipped = track.clip(polygon, projection)
+
+        self.assertIsNot(track, clipped)
+        self.assertEqual('walk', clipped.name)
+        self.assertEqual('d', clipped.description)
+        self.assertEqual(3, clipped.number)
+        self.assertEqual('hike', clipped.type)
+        self.assertEqual(1, len(clipped.segments))
+        self.assertEqual(2, len(clipped.segments[0].points))
+        # Original untouched:
+        self.assertEqual(1, len(track.segments))
+        self.assertEqual(2, len(track.segments[0].points))
+
+    def test_clip_rejects_self_intersecting_polygon(self) -> None:
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        bowtie = mod_clip.Polygon([(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)])
+        segment = mod_gpx.GPXTrackSegment([self._clip_point(0.5, 0.5)])
+
+        with self.assertRaises(mod_clip.ClipError):
+            segment.clip(bowtie, projection)
+
+    def test_clip_rejects_hole_outside_exterior(self) -> None:
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        polygon = mod_clip.Polygon(
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            holes=[[(2.0, 2.0), (2.4, 2.0), (2.4, 2.4), (2.0, 2.4)]])
+        segment = mod_gpx.GPXTrackSegment([self._clip_point(0.5, 0.5)])
+
+        with self.assertRaises(mod_clip.ClipError):
+            segment.clip(polygon, projection)
+
+    def test_clip_rejects_span_too_large(self) -> None:
+        """Far-away data must be refused instead of pretending global exactness."""
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=10_000)
+        polygon = self._rectangle_polygon()
+        segment = mod_gpx.GPXTrackSegment([self._clip_point(0.5, 0.5)])
+
+        with self.assertRaises(mod_clip.ClipError):
+            segment.clip(polygon, projection)
+
+    def test_clip_requires_explicit_projection(self) -> None:
+        polygon = self._rectangle_polygon()
+        projection = mod_clip.LocalProjection(0.5, 0.5, max_extent=400_000)
+        segment = mod_gpx.GPXTrackSegment([self._clip_point(0.5, 0.4),
+                                           self._clip_point(0.5, 0.6)])
+
+        # Both arguments are mandatory positional/keyword geometry inputs:
+        with self.assertRaises(TypeError):
+            segment.clip(polygon)  # type: ignore
+        self.assertEqual(1, len(segment.clip(polygon, projection)))
 
 if __name__ == '__main__':
     mod_unittest.main()

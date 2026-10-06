@@ -28,6 +28,9 @@ from . import gpxfield as mod_gpxfield
 
 from typing import *
 
+if TYPE_CHECKING:
+    from . import clip as mod_clip
+
 log = mod_logging.getLogger(__name__)
 
 IGNORE_TOP_SPEED_PERCENTILES = 0.05
@@ -848,6 +851,21 @@ class GPXTrackSegment:
         part_2 = self.points[point_no + 1:]
 
         self.points = part_1 + part_2
+
+    def clip(self, polygon: "mod_clip.Polygon",
+             projection: "mod_clip.LocalProjection") -> List["GPXTrackSegment"]:
+        """
+        Clip this segment against a planar polygon, possibly into several segments.
+
+        See :mod:`gpxpy.clip` for details: the caller must provide a
+        :class:`~gpxpy.clip.LocalProjection` (the planar approximation is not
+        globally exact), the polygon may contain holes, and intersection points
+        get interpolated time/elevation but no fabricated extensions. This
+        segment is never modified.
+        """
+        from . import clip as mod_clip
+
+        return mod_clip.clip_segment(self, polygon, projection)
 
     def get_moving_data(self, stopped_speed_threshold: Optional[float]=None, raw: bool=False, speed_extreemes_percentiles: float=IGNORE_TOP_SPEED_PERCENTILES, ignore_nonstandard_distances: bool = True) -> Optional[MovingData]:
         """
@@ -1902,7 +1920,22 @@ class GPXTrack:
         return min((NearestLocationData(pt, -1, seg, pt_no) for (pt, seg, pt_no) in self.walk()) # type: ignore
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
-        
+
+    def clip(self, polygon: "mod_clip.Polygon",
+             projection: "mod_clip.LocalProjection") -> "GPXTrack":
+        """
+        Clip all segments of this track against a planar polygon.
+
+        Returns a new :class:`GPXTrack` with the same metadata and one segment
+        per portion of the track inside the polygon (a single input segment may
+        produce several output segments). See :mod:`gpxpy.clip` for the
+        projection, holes, interpolation and validation semantics. This track
+        is never modified.
+        """
+        from . import clip as mod_clip
+
+        return mod_clip.clip_track(self, polygon, projection)
+
     def clone(self) -> "GPXTrack":
         return mod_copy.deepcopy(self)
 

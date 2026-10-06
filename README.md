@@ -65,6 +65,28 @@ gpx_segment.points.append(gpxpy.gpx.GPXTrackPoint(2.1236, 5.1236, elevation=1236
 print('Created GPX:', gpx.to_xml())
 ```
 
+## Polygon clipping
+
+Tracks can be clipped to a polygon (a simple ring with optional holes) with `gpxpy.clip`. This keeps "both ends outside, middle through the area" trajectories: a single segment can be split into several output segments.
+
+Clipping happens in a **local planar projection**, so you must explicitly choose a base point. This is an approximation valid only within a limited area, *not* a globally exact computation; data spanning too large an area (default 50 km from the base point), or self-intersecting/invalid polygons, raise `gpxpy.clip.ClipError`.
+
+```python
+import gpxpy.gpx
+import gpxpy.clip
+
+projection = gpxpy.clip.LocalProjection(base_latitude=0.5, base_longitude=0.5,
+                                        max_extent=400_000)
+park = gpxpy.clip.Polygon(
+    exterior=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    holes=[[(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)]])
+
+clipped_track = track.clip(park, projection)         # new GPXTrack
+segments = segment.clip(park, projection)            # list of GPXTrackSegment
+```
+
+Paths on a boundary, including a hole boundary, are retained. Time and elevation of newly created intersection points are interpolated along the intersected edge; original points keep all their data (including extensions), and extensions are not invented for intersection points. The original GPX objects are never modified.
+
 ## GPX version
 
 gpx.py can parse and generate GPX 1.0 and 1.1 files. The generated file will always be a valid XML document, but it may not be (strictly speaking) a valid GPX document. For example, if you set gpx.email to "my.email AT mail.com" the generated GPX tag won't confirm to the regex pattern. And the file won't be valid. Most applications will ignore such errors, but... Be aware of this!
@@ -119,4 +141,3 @@ pip install gpx-cmd-tools
 ## License
 
 GPX.py is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
-

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Clip tracks against a planar polygon (optionally with holes): `track.clip(polygon, projection)` / `segment.clip(...)` in the new `gpxpy.clip` module. The caller must provide an explicit local projection base point; overly large spans and self-intersecting polygons are rejected. One track can be split into several segments; intersection time/elevation are interpolated while extensions of original points are preserved and nothing is fabricated for new points. Boundary (including hole boundary) contact is retained.
+
 ## v1.6.1
 
 - Minor fix

@@ -15,8 +15,12 @@
 from typing import IO, AnyStr
 
 from . import gpx as mod_gpx
+from . import clip as mod_clip
 
 __version__ = '1.6.2'
+
+# Re-exported for convenience: ``gpxpy.clip.LocalProjection`` etc. also work.
+clip = mod_clip
 
 def parse(xml_or_file: AnyStr | IO[str], version: str | None = None) -> mod_gpx.GPX:
     """
