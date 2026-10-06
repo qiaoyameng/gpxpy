@@ -3706,5 +3706,111 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
 
+    def make_two_point_segment(
+            self,
+            start_latitude: float,
+            start_longitude: float,
+            end_latitude: float,
+            end_longitude: float,
+            start_time: Optional[mod_datetime.datetime]=None,
+            end_time: Optional[mod_datetime.datetime]=None) -> mod_gpx.GPXTrackSegment:
+        return mod_gpx.GPXTrackSegment([
+            mod_gpx.GPXTrackPoint(start_latitude, start_longitude, time=start_time),
+            mod_gpx.GPXTrackPoint(end_latitude, end_longitude, time=end_time),
+        ])
+
+    def test_stitch_segments_uses_global_path_cover_not_nearest_edge_greedy(self) -> None:
+        base_time = mod_datetime.datetime(2020, 1, 1, 10)
+        minute = mod_datetime.timedelta(minutes=1)
+        segments = [
+            self.make_two_point_segment(0, 0, 0, .020, base_time, base_time + minute),
+            self.make_two_point_segment(0, .010, 0, .020, base_time + 2 * minute, base_time + 3 * minute),
+            self.make_two_point_segment(0, .020, 0, .030, base_time + 4 * minute, base_time + 5 * minute),
+            self.make_two_point_segment(0, .030, 0, .040, base_time + 6 * minute, base_time + 7 * minute),
+        ]
+
+        result = mod_gpxpy.stitch_segments(segments, 1500, mod_datetime.timedelta(minutes=1, seconds=1))
+
+        self.assertEqual(1, len(result.tracks))
+        self.assertEqual((0, 1, 2, 3), result.tracks[0].segment_indices)
+        self.assertEqual((False, False, False, False), result.tracks[0].reversed_segments)
+        self.assertEqual((1, 2, 3), tuple(connection.to_segment_index for connection in result.tracks[0].connections))
+        self.assertGreater(result.tracks[0].connections[0].distance, 1000)
+        self.assertEqual(0, result.tracks[0].connections[1].distance)
+        self.assertEqual(0, result.tracks[0].connections[2].distance)
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(1, result.optimal_solution_count)
+        self.assertEqual((0, .010), (segments[1].points[0].latitude, segments[1].points[0].longitude))
+
+    def test_stitch_segments_does_not_reverse_in_place(self) -> None:
+        reversed_segment = self.make_two_point_segment(0, .020, 0, .010)
+        original_points = list(reversed_segment.points)
+        segments = [
+            self.make_two_point_segment(
+                0, 0, 0, .010,
+                mod_datetime.datetime(2020, 1, 1, 10),
+                mod_datetime.datetime(2020, 1, 1, 10, 1)),
+            reversed_segment,
+        ]
+
+        result = mod_gpxpy.stitch_segments(segments, 1500, mod_datetime.timedelta(minutes=2))
+
+        self.assertEqual((0, 1), result.tracks[0].segment_indices)
+        self.assertEqual((False, True), result.tracks[0].reversed_segments)
+        self.assertIs(original_points[0], reversed_segment.points[0])
+        self.assertIs(original_points[1], reversed_segment.points[1])
+        self.assertEqual(.010, result.tracks[0].track.segments[1].points[0].longitude)
+
+    def test_stitch_segments_does_not_reverse_when_timestamps_move_backward(self) -> None:
+        base_time = mod_datetime.datetime(2020, 1, 1, 10)
+        segments = [
+            self.make_two_point_segment(
+                0, 0, 0, .010, base_time, base_time + mod_datetime.timedelta(minutes=1)),
+            self.make_two_point_segment(
+                0, .030, 0, .010,
+                base_time + mod_datetime.timedelta(minutes=2),
+                base_time + mod_datetime.timedelta(minutes=3)),
+        ]
+
+        result = mod_gpxpy.stitch_segments(segments, 1500, mod_datetime.timedelta(minutes=5))
+
+        self.assertEqual(2, len(result.tracks))
+        self.assertEqual((), result.connections)
+
+    def test_stitch_segments_rejects_close_time_regression(self) -> None:
+        base_time = mod_datetime.datetime(2020, 1, 1, 10)
+        segments = [
+            self.make_two_point_segment(0, 0, 0, .010, base_time, base_time + mod_datetime.timedelta(minutes=2)),
+            self.make_two_point_segment(0, .010, 0, .020, base_time, base_time + mod_datetime.timedelta(minutes=1)),
+        ]
+
+        result = mod_gpxpy.stitch_segments(segments, 1500, mod_datetime.timedelta(hours=1))
+
+        self.assertEqual(2, len(result.tracks))
+        self.assertEqual((), result.connections)
+
+    def test_stitch_segments_reports_equivalent_optima_stably(self) -> None:
+        segment = self.make_two_point_segment(0, 0, 0, .010)
+        left_segment = self.make_two_point_segment(0, -.010, 0, 0)
+        right_segment = self.make_two_point_segment(0, .010, 0, .020)
+
+        result = mod_gpxpy.stitch_segments([segment, left_segment, right_segment], 1500, None)
+
+        self.assertTrue(result.ambiguous)
+        self.assertGreater(result.optimal_solution_count, 1)
+        self.assertEqual(1, len(result.tracks))
+        self.assertEqual((1, 0, 2), result.tracks[0].segment_indices)
+
+    def test_stitch_segments_excludes_empty_segment_with_reason(self) -> None:
+        valid_segment = self.make_two_point_segment(0, 0, 0, .010)
+        empty_segment = mod_gpx.GPXTrackSegment()
+
+        result = mod_gpxpy.stitch_segments([valid_segment, empty_segment], 10)
+
+        self.assertEqual(1, len(result.tracks))
+        self.assertEqual((0,), result.tracks[0].segment_indices)
+        self.assertEqual((1,), tuple(item.segment_index for item in result.excluded_segments))
+        self.assertEqual('segment has no points', result.excluded_segments[0].reason)
+
 if __name__ == '__main__':
     mod_unittest.main()

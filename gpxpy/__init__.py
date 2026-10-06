@@ -15,6 +15,11 @@
 from typing import IO, AnyStr
 
 from . import gpx as mod_gpx
+from .stitch import ExcludedSegment
+from .stitch import SegmentStitchConnection
+from .stitch import SegmentStitchResult
+from .stitch import SegmentStitchTrack
+from .stitch import stitch_segments
 
 __version__ = '1.6.2'
 
