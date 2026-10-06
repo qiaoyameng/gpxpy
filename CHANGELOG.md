@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.6.2
+
+- Explicit peak/valley threshold mode for uphill/downhill statistics: `get_uphill_downhill_peak_valley(min_vertical_change, min_horizontal_distance, include_unconfirmed_end)` on the segment, track and GPX objects (and `gpxpy.geo.calculate_uphill_downhill_peak_valley`). A peak/valley is only confirmed on a reversal reaching both thresholds; the unconfirmed end change is excluded by default and its extremum is returned. Missing elevations and segment breaks split the track instead of being joined, and repeated positions cannot satisfy the horizontal distance. The smoothed `get_uphill_downhill()` default is unchanged.
+
 ## v1.6.1
 
 - Minor fix

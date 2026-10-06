@@ -124,6 +124,27 @@ class MovingData(NamedTuple):
 class UphillDownhill(NamedTuple):
     uphill: float
     downhill: float
+class PeakValleyExtremum(NamedTuple):
+    """
+    A peak/valley (or the unconfirmed end extremum) found by the explicit
+    peak/valley uphill/downhill calculation.
+
+    ``track_no``/``segment_no`` are set by the GPXTrack/GPX level methods and
+    stay -1 at the segment level.
+    """
+    location: "GPXTrackPoint"
+    point_no: int
+    elevation: float
+    kind: str
+    track_no: int = -1
+    segment_no: int = -1
+class PeakValleyUphillDownhill(NamedTuple):
+    uphill: float
+    downhill: float
+    peaks: List[PeakValleyExtremum]
+    valleys: List[PeakValleyExtremum]
+    unconfirmed_end: Optional[PeakValleyExtremum]
+    end_included: bool
 class MinimumMaximum(NamedTuple):
     minimum: Optional[float]
     maximum: Optional[float]
@@ -1167,6 +1188,56 @@ class GPXTrackSegment:
 
         return UphillDownhill(uphill, downhill)
 
+    def get_uphill_downhill_peak_valley(self,
+                                        min_vertical_change: float,
+                                        min_horizontal_distance: float,
+                                        include_unconfirmed_end: bool=False) -> PeakValleyUphillDownhill:
+        """
+        Calculate uphill/downhill climbs with an explicit peak/valley
+        threshold mode instead of fixed three-point smoothing.
+
+        A peak or valley is only confirmed once a reversal reaches both the
+        minimum vertical change (meters of elevation) and the minimum
+        horizontal distance (direct distance in meters). The unconfirmed
+        change at the end is not counted unless
+        ``include_unconfirmed_end`` is True; the extremum itself is returned
+        either way in ``unconfirmed_end``.
+
+        Points with missing elevation split the segment into independent
+        runs and are never joined across the gap. Repeated positions cannot
+        satisfy the horizontal distance on their own.
+
+        Returns
+        -------
+        PeakValleyUphillDownhill
+        """
+        result = mod_geo.calculate_uphill_downhill_peak_valley(
+            self.points,
+            min_vertical_change=min_vertical_change,
+            min_horizontal_distance=min_horizontal_distance,
+            include_unconfirmed_end=include_unconfirmed_end)
+
+        def _to_extremum(extremum: mod_geo.ElevationExtremum) -> PeakValleyExtremum:
+            return PeakValleyExtremum(
+                location=self.points[extremum.index],
+                point_no=extremum.index,
+                elevation=extremum.elevation,
+                kind=extremum.kind)
+
+        unconfirmed_end: Optional[PeakValleyExtremum]
+        if result.unconfirmed_end is None:
+            unconfirmed_end = None
+        else:
+            unconfirmed_end = _to_extremum(result.unconfirmed_end)
+
+        return PeakValleyUphillDownhill(
+            uphill=result.uphill,
+            downhill=result.downhill,
+            peaks=[_to_extremum(peak) for peak in result.peaks],
+            valleys=[_to_extremum(valley) for valley in result.valleys],
+            unconfirmed_end=unconfirmed_end,
+            end_included=result.end_included)
+
     def get_elevation_extremes(self) -> MinimumMaximum:
         """
         Calculate elevation extremes of track segment
@@ -1799,6 +1870,40 @@ class GPXTrack:
 
         return UphillDownhill(uphill, downhill)
 
+    def get_uphill_downhill_peak_valley(self,
+                                        min_vertical_change: float,
+                                        min_horizontal_distance: float,
+                                        include_unconfirmed_end: bool=False) -> PeakValleyUphillDownhill:
+        """
+        Peak/valley threshold uphill/downhill calculation for the whole track.
+
+        See ``GPXTrackSegment.get_uphill_downhill_peak_valley``. Segments are
+        analyzed independently and are never joined; ``unconfirmed_end`` is
+        taken from the last segment containing elevation data.
+        """
+        uphill: float = 0
+        downhill: float = 0
+        peaks: List[PeakValleyExtremum] = []
+        valleys: List[PeakValleyExtremum] = []
+        unconfirmed_end: Optional[PeakValleyExtremum] = None
+
+        for segment_no, track_segment in enumerate(self.segments):
+            result = track_segment.get_uphill_downhill_peak_valley(
+                min_vertical_change=min_vertical_change,
+                min_horizontal_distance=min_horizontal_distance,
+                include_unconfirmed_end=include_unconfirmed_end)
+            uphill += result.uphill
+            downhill += result.downhill
+            for peak in result.peaks:
+                peaks.append(peak._replace(segment_no=segment_no))
+            for valley in result.valleys:
+                valleys.append(valley._replace(segment_no=segment_no))
+            if result.unconfirmed_end is not None:
+                unconfirmed_end = result.unconfirmed_end._replace(segment_no=segment_no)
+
+        return PeakValleyUphillDownhill(uphill, downhill, peaks, valleys,
+                                        unconfirmed_end, include_unconfirmed_end)
+
     def get_location_at(self, time: mod_datetime.datetime) -> List[GPXTrackPoint]:
         """
         Gets approx. location at given time. Note that, at the moment this
@@ -2385,6 +2490,41 @@ class GPX:
             downhill += current_downhill or 0
 
         return UphillDownhill(uphill, downhill)
+
+    def get_uphill_downhill_peak_valley(self,
+                                        min_vertical_change: float,
+                                        min_horizontal_distance: float,
+                                        include_unconfirmed_end: bool=False) -> PeakValleyUphillDownhill:
+        """
+        Peak/valley threshold uphill/downhill calculation for the gpx file.
+
+        See ``GPXTrackSegment.get_uphill_downhill_peak_valley``. Tracks and
+        segments are analyzed independently and are never joined;
+        ``unconfirmed_end`` comes from the last segment (in track order) that
+        contains elevation data.
+        """
+        uphill: float = 0
+        downhill: float = 0
+        peaks: List[PeakValleyExtremum] = []
+        valleys: List[PeakValleyExtremum] = []
+        unconfirmed_end: Optional[PeakValleyExtremum] = None
+
+        for track_no, track in enumerate(self.tracks):
+            result = track.get_uphill_downhill_peak_valley(
+                min_vertical_change=min_vertical_change,
+                min_horizontal_distance=min_horizontal_distance,
+                include_unconfirmed_end=include_unconfirmed_end)
+            uphill += result.uphill
+            downhill += result.downhill
+            for peak in result.peaks:
+                peaks.append(peak._replace(track_no=track_no))
+            for valley in result.valleys:
+                valleys.append(valley._replace(track_no=track_no))
+            if result.unconfirmed_end is not None:
+                unconfirmed_end = result.unconfirmed_end._replace(track_no=track_no)
+
+        return PeakValleyUphillDownhill(uphill, downhill, peaks, valleys,
+                                        unconfirmed_end, include_unconfirmed_end)
 
     def get_location_at(self, time: mod_datetime.datetime) -> List[mod_geo.Location]:
         """

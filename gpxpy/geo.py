@@ -234,6 +234,233 @@ def calculate_uphill_downhill(elevations: List[Optional[float]]) -> Tuple[float,
     return uphill, downhill
 
 
+class ElevationExtremum(NamedTuple):
+    """
+    A confirmed peak or valley, or the unconfirmed extremum at the end of a
+    track.
+
+    Attributes
+    ----------
+    index:
+        Position of the extremum in the list of points supplied to the
+        calculation.
+    elevation:
+        Elevation of the extremum in meters.
+    kind:
+        ``"peak"`` or ``"valley"``.
+    """
+    index: int
+    elevation: float
+    kind: str
+
+
+class PeakValleyUphillDownhill(NamedTuple):
+    """
+    Result of the explicit peak/valley (no smoothing) uphill/downhill
+    calculation.
+
+    Peaks and valleys alternate; ``uphill``/``downhill`` are the sums of the
+    elevation differences between consecutive confirmed peaks and valleys.
+
+    Attributes
+    ----------
+    uphill:
+        Total confirmed uphill elevation in meters.
+    downhill:
+        Total confirmed downhill elevation in meters.
+    peaks:
+        Confirmed peaks in chronological order.
+    valleys:
+        Confirmed valleys in chronological order.
+    unconfirmed_end:
+        The extremum of the leg still open at the end of the data, if any.
+        It is only included in ``uphill``/``downhill`` when
+        ``include_unconfirmed_end`` was ``True``; the extremum is returned
+        either way.
+    end_included:
+        Whether ``unconfirmed_end`` is counted in the totals.
+    """
+    uphill: float
+    downhill: float
+    peaks: List[ElevationExtremum]
+    valleys: List[ElevationExtremum]
+    unconfirmed_end: Optional[ElevationExtremum]
+    end_included: bool
+
+
+def calculate_uphill_downhill_peak_valley(points: List["Location"],
+                                          min_vertical_change: float,
+                                          min_horizontal_distance: float,
+                                          include_unconfirmed_end: bool=False) -> PeakValleyUphillDownhill:
+    """
+    Compute uphill and downhill elevation with an explicit peak/valley
+    threshold mode instead of the fixed three-point smoothing.
+
+    A move is only recognized once it reaches *both* ``min_vertical_change``
+    (meters of elevation) and ``min_horizontal_distance`` (meters of direct
+    horizontal distance between the extremum and the confirming point). A
+    peak is confirmed when the track subsequently reverses by at least
+    ``min_vertical_change`` over at least ``min_horizontal_distance``, and
+    vice versa for valleys.
+
+    Points with missing elevation (``None``) split the data: the runs before
+    and after such a gap are analyzed independently and are never joined.
+    Repeated positions cannot establish a leg, because their direct
+    horizontal distance is zero.
+
+    Parameters
+    ----------
+    points:
+        Locations with elevations; ``elevation`` may be ``None``.
+    min_vertical_change:
+        Minimum elevation change (meters) required to recognize a move.
+    min_horizontal_distance:
+        Minimum direct horizontal distance (meters) required to recognize a
+        move.
+    include_unconfirmed_end:
+        If ``True``, the elevation difference of the leg still open at the
+        end of the data is counted; if ``False`` (default) only confirmed
+        peaks/valleys contribute. The unconfirmed end extremum is reported in
+        both cases.
+
+    Returns
+    ----------
+    PeakValleyUphillDownhill
+    """
+    if min_vertical_change < 0:
+        raise ValueError(f'min_vertical_change must be >= 0, got {min_vertical_change}')
+    if min_horizontal_distance < 0:
+        raise ValueError(f'min_horizontal_distance must be >= 0, got {min_horizontal_distance}')
+
+    peaks: List[ElevationExtremum] = []
+    valleys: List[ElevationExtremum] = []
+    uphill: float = 0.
+    downhill: float = 0.
+    unconfirmed_end: Optional[ElevationExtremum] = None
+
+    def _distance_2d(index_1: int, index_2: int) -> float:
+        point_1 = points[index_1]
+        point_2 = points[index_2]
+        d = point_1.distance_2d(point_2)
+        return d if d is not None else 0.
+
+    def _reaches_thresholds(extremum_index: int, current_index: int, elevation_diff: float) -> bool:
+        return (abs(elevation_diff) >= min_vertical_change
+                and _distance_2d(extremum_index, current_index) >= min_horizontal_distance)
+
+    def _analyze_run(run_indices: List[int], is_last_run: bool) -> None:
+        nonlocal uphill, downhill, unconfirmed_end
+
+        if len(run_indices) < 2:
+            return
+
+        def _elevation(position: int) -> float:
+            elevation = points[run_indices[position]].elevation
+            assert elevation is not None
+            return elevation
+
+        def _distance(pos_1: int, pos_2: int) -> float:
+            return _distance_2d(run_indices[pos_1], run_indices[pos_2])
+
+        # direction: None = no leg established yet, +1 = up leg, -1 = down leg
+        direction: Optional[int] = None
+        # Position (within run_indices) of the running extremum of the open leg.
+        extremum_pos = 0
+        # Positions of confirmed pivots; the first one is the leg origin.
+        pivot_positions: List[int] = []
+
+        def _confirm(position: int, kind: str) -> None:
+            nonlocal uphill, downhill
+            index = run_indices[position]
+            elevation = _elevation(position)
+            if kind == 'peak':
+                peaks.append(ElevationExtremum(index, elevation, 'peak'))
+            else:
+                valleys.append(ElevationExtremum(index, elevation, 'valley'))
+            if pivot_positions:
+                diff = elevation - _elevation(pivot_positions[-1])
+                if diff > 0:
+                    uphill += diff
+                else:
+                    downhill -= diff
+            pivot_positions.append(position)
+
+        for pos in range(1, len(run_indices)):
+            elevation = _elevation(pos)
+            if direction is None:
+                # First significant move; ties resolve to up for determinism.
+                if (elevation > _elevation(0)
+                        and elevation - _elevation(0) >= min_vertical_change
+                        and _distance(0, pos) >= min_horizontal_distance):
+                    lo_pos = min(range(pos + 1), key=lambda p: _elevation(p))
+                    if (elevation > _elevation(lo_pos)
+                            and elevation - _elevation(lo_pos) >= min_vertical_change
+                            and _distance(lo_pos, pos) >= min_horizontal_distance):
+                        _confirm(lo_pos, 'valley')
+                        extremum_pos = max(range(lo_pos, pos + 1), key=lambda p: _elevation(p))
+                        direction = 1
+                elif (elevation < _elevation(0)
+                        and elevation - _elevation(0) <= -min_vertical_change
+                        and _distance(0, pos) >= min_horizontal_distance):
+                    hi_pos = max(range(pos + 1), key=lambda p: _elevation(p))
+                    if (elevation < _elevation(hi_pos)
+                            and _elevation(hi_pos) - elevation >= min_vertical_change
+                            and _distance(hi_pos, pos) >= min_horizontal_distance):
+                        _confirm(hi_pos, 'peak')
+                        extremum_pos = min(range(hi_pos, pos + 1), key=lambda p: _elevation(p))
+                        direction = -1
+            elif direction == 1:
+                if elevation >= _elevation(extremum_pos):
+                    extremum_pos = pos
+                else:
+                    reversal = elevation - _elevation(extremum_pos)
+                    if _reaches_thresholds(run_indices[extremum_pos], run_indices[pos], reversal):
+                        _confirm(extremum_pos, 'peak')
+                        # Running valley of the new down leg, between the
+                        # confirmed peak and the confirming point inclusive.
+                        extremum_pos = min(range(extremum_pos, pos + 1), key=lambda p: _elevation(p))
+                        direction = -1
+            else:  # direction == -1
+                if elevation <= _elevation(extremum_pos):
+                    extremum_pos = pos
+                else:
+                    reversal = elevation - _elevation(extremum_pos)
+                    if _reaches_thresholds(run_indices[extremum_pos], run_indices[pos], reversal):
+                        _confirm(extremum_pos, 'valley')
+                        extremum_pos = max(range(extremum_pos, pos + 1), key=lambda p: _elevation(p))
+                        direction = 1
+
+        if direction is not None and is_last_run:
+            kind = 'peak' if direction == 1 else 'valley'
+            extremum_index = run_indices[extremum_pos]
+            unconfirmed_end = ElevationExtremum(extremum_index, _elevation(extremum_pos), kind)
+            if include_unconfirmed_end and pivot_positions:
+                diff = _elevation(extremum_pos) - _elevation(pivot_positions[-1])
+                if diff > 0:
+                    uphill += diff
+                else:
+                    downhill -= diff
+
+    # Split into contiguous runs of points with elevation.
+    run: List[int] = []
+    runs: List[List[int]] = []
+    for index, point in enumerate(points):
+        if point.elevation is None:
+            if run:
+                runs.append(run)
+                run = []
+        else:
+            run.append(index)
+    if run:
+        runs.append(run)
+
+    for run_number, run_indices in enumerate(runs):
+        _analyze_run(run_indices, is_last_run=(run_number == len(runs) - 1))
+
+    return PeakValleyUphillDownhill(uphill, downhill, peaks, valleys,
+                                   unconfirmed_end, include_unconfirmed_end)
+
+
 def distance(latitude_1: float, longitude_1: float, elevation_1: Optional[float],
             latitude_2: float, longitude_2: float, elevation_2: Optional[float],
             haversine: bool=False) -> float:

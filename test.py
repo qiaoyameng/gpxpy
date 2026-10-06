@@ -1827,6 +1827,169 @@ class GPXTests(mod_unittest.TestCase):
         self.assertEqual(10, up)
         self.assertEqual(0, down)
 
+    # -- Explicit peak/valley threshold uphill/downhill calculation ---------
+
+    # Each point is ~556m east of the previous one at the equator, well above
+    # the 100m horizontal threshold used in these tests.
+    LONGITUDE_STEP = 0.005
+
+    def _peak_valley_segment(self, elevations: List[Optional[float]],
+                             step: float=LONGITUDE_STEP) -> mod_gpx.GPXTrackSegment:
+        segment = mod_gpx.GPXTrackSegment()
+        for point_no, elevation in enumerate(elevations):
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                latitude=0, longitude=point_no * step, elevation=elevation))
+        return segment
+
+    def test_peak_valley_flat_noise(self) -> None:
+        # Flat ground with +/-1m noise: no move ever reaches the 10m/100m
+        # thresholds, so the result is zero even with hundreds of points.
+        segment = self._peak_valley_segment([0, 1, -1, 0, 1, -1, 0])
+
+        result = segment.get_uphill_downhill_peak_valley(10, 100)
+
+        self.assertEqual(0, result.uphill)
+        self.assertEqual(0, result.downhill)
+        self.assertEqual([], result.peaks)
+        self.assertEqual([], result.valleys)
+        self.assertIsNone(result.unconfirmed_end)
+        self.assertFalse(result.end_included)
+
+    def test_peak_valley_single_climb_small_pullback(self) -> None:
+        # 0 -> 10 -> 20 -> 15: the 5m pullback at the end does not reach the
+        # 10m vertical threshold, so the peak at 20m is not confirmed.
+        segment = self._peak_valley_segment([0, 10, 20, 15])
+
+        excluded = segment.get_uphill_downhill_peak_valley(10, 100)
+        self.assertEqual(0, excluded.uphill)
+        self.assertEqual(0, excluded.downhill)
+        self.assertEqual([], excluded.peaks)
+        # The unconfirmed end is reported ...
+        self.assertIsNotNone(excluded.unconfirmed_end)
+        self.assertEqual('peak', excluded.unconfirmed_end.kind)
+        self.assertEqual(2, excluded.unconfirmed_end.point_no)
+        self.assertEqual(20, excluded.unconfirmed_end.elevation)
+        self.assertIs(segment.points[2], excluded.unconfirmed_end.location)
+        self.assertFalse(excluded.end_included)
+
+        # ... and only counted when the caller opts in.
+        included = segment.get_uphill_downhill_peak_valley(10, 100, include_unconfirmed_end=True)
+        self.assertEqual(20, included.uphill)
+        self.assertEqual(0, included.downhill)
+        self.assertTrue(included.end_included)
+
+        # A reversal reaching the threshold confirms the peak and leaves a new
+        # unconfirmed valley: 0 -> 20 is uphill, the drop to 5 is open.
+        confirmed = self._peak_valley_segment([0, 10, 20, 5])
+        result = confirmed.get_uphill_downhill_peak_valley(10, 100)
+        self.assertEqual(20, result.uphill)
+        self.assertEqual(0, result.downhill)
+        self.assertEqual([2], [peak.point_no for peak in result.peaks])
+        self.assertEqual(5, result.unconfirmed_end.elevation)
+        result_incl = confirmed.get_uphill_downhill_peak_valley(10, 100, include_unconfirmed_end=True)
+        self.assertEqual(20, result_incl.uphill)
+        self.assertEqual(15, result_incl.downhill)
+
+    def test_peak_valley_missing_elevation_in_the_middle(self) -> None:
+        # A point with missing elevation must split the segment: the two
+        # 0 -> 20 runs are analyzed independently and never joined.
+        segment = self._peak_valley_segment([0, 10, 20, None, 0, 10, 20])
+
+        result = segment.get_uphill_downhill_peak_valley(10, 100)
+        self.assertEqual(0, result.uphill)
+        self.assertEqual(0, result.downhill)
+        self.assertEqual([], result.peaks)
+        # Only the final run can leave an unconfirmed end.
+        self.assertEqual(6, result.unconfirmed_end.point_no)
+        self.assertEqual(20, result.unconfirmed_end.elevation)
+
+        included = segment.get_uphill_downhill_peak_valley(10, 100, include_unconfirmed_end=True)
+        self.assertEqual(20, included.uphill)
+        self.assertEqual(0, included.downhill)
+
+        # Without the gap the runs would be joined: peak at 20 confirmed by
+        # the drop back to 0, then a second climb to 20 at the end.
+        connected = self._peak_valley_segment([0, 10, 20, 0, 10, 20])
+        connected_result = connected.get_uphill_downhill_peak_valley(10, 100, include_unconfirmed_end=True)
+        self.assertEqual(40, connected_result.uphill)
+        self.assertEqual(20, connected_result.downhill)
+        self.assertEqual([2], [peak.point_no for peak in connected_result.peaks])
+        self.assertEqual([0, 3], [valley.point_no for valley in connected_result.valleys])
+
+    def test_peak_valley_repeated_position_does_not_count(self) -> None:
+        # 20m of climb at the very same location: the vertical threshold is
+        # met but the horizontal one is not, so nothing is counted.
+        segment = mod_gpx.GPXTrackSegment()
+        for elevation in (0, 10, 20):
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                latitude=0, longitude=0, elevation=elevation))
+
+        result = segment.get_uphill_downhill_peak_valley(10, 100, include_unconfirmed_end=True)
+        self.assertEqual(0, result.uphill)
+        self.assertEqual(0, result.downhill)
+        self.assertIsNone(result.unconfirmed_end)
+
+    def test_peak_valley_segment_breaks_are_not_joined(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        track.segments.append(self._peak_valley_segment([0, 10, 20]))
+        track.segments.append(self._peak_valley_segment([0, 10, 20]))
+
+        result = track.get_uphill_downhill_peak_valley(10, 100, include_unconfirmed_end=True)
+        # Each segment is an independent unconfirmed climb of 20m.
+        self.assertEqual(40, result.uphill)
+        self.assertEqual(0, result.downhill)
+        self.assertEqual(-1, result.unconfirmed_end.track_no)
+        self.assertEqual(1, result.unconfirmed_end.segment_no)
+
+        # The GPX level fills in the track number.
+        gpx_result = gpx.get_uphill_downhill_peak_valley(10, 100, include_unconfirmed_end=True)
+        self.assertEqual(0, gpx_result.unconfirmed_end.track_no)
+        self.assertEqual(1, gpx_result.unconfirmed_end.segment_no)
+        self.assertEqual(40, gpx_result.uphill)
+
+    def test_peak_valley_density_independence_on_flat_ground(self) -> None:
+        # The same +/-1m flat-ground wiggle sampled densely or sparsely must
+        # not accumulate uphill/downhill when the thresholds reject the noise.
+        noisy_elevations = [1 if point_no % 2 else -1 for point_no in range(200)]
+        dense = self._peak_valley_segment(noisy_elevations, step=0.0005)
+        sparse = self._peak_valley_segment(noisy_elevations[::10], step=0.005)
+
+        dense_result = dense.get_uphill_downhill_peak_valley(5, 50)
+        sparse_result = sparse.get_uphill_downhill_peak_valley(5, 50)
+
+        self.assertEqual(sparse_result.uphill, dense_result.uphill)
+        self.assertEqual(sparse_result.downhill, dense_result.downhill)
+        self.assertEqual(0, dense_result.uphill)
+        self.assertEqual(0, dense_result.downhill)
+
+    def test_peak_valley_density_independence_on_hills(self) -> None:
+        # Same 0->100->0 hill range sampled every 500m or every ~55m:
+        # sampling density must not change the totals or the pivots.
+        elevations = [0, 50, 100, 50, 0, 50, 100, 50, 0, 50, 100]
+        dense_elevations: List[float] = []
+        for index in range(len(elevations) - 1):
+            for fraction in range(10):
+                dense_elevations.append(
+                    elevations[index] + (elevations[index + 1] - elevations[index]) * fraction / 10)
+        dense_elevations.append(elevations[-1])
+
+        dense = self._peak_valley_segment(dense_elevations, step=0.0005)
+        sparse = self._peak_valley_segment(elevations, step=0.005)
+
+        dense_result = dense.get_uphill_downhill_peak_valley(50, 50)
+        sparse_result = sparse.get_uphill_downhill_peak_valley(50, 50)
+
+        self.assertEqual(200, dense_result.uphill)
+        self.assertEqual(200, dense_result.downhill)
+        self.assertEqual(sparse_result.uphill, dense_result.uphill)
+        self.assertEqual(sparse_result.downhill, dense_result.downhill)
+        self.assertEqual(2, len(dense_result.peaks))
+        self.assertEqual(3, len(dense_result.valleys))
+        self.assertEqual([point.point_no for point in sparse_result.peaks],
+                         [point.point_no // 10 for point in dense_result.peaks])
+
     def test_time_difference(self) -> None:
         point_1 = mod_gpx.GPXTrackPoint(latitude=13, longitude=12,
                                         time=mod_datetime.datetime(2013, 1, 2, 12, 31))
