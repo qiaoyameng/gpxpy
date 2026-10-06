@@ -234,6 +234,122 @@ def calculate_uphill_downhill(elevations: List[Optional[float]]) -> Tuple[float,
     return uphill, downhill
 
 
+def calculate_uphill_downhill_threshold(elevations: List[Optional[float]],
+                                        horizontal_distances: List[float],
+                                        min_elevation_change: float,
+                                        min_horizontal_distance: float=0.) -> Tuple[float, float, List[int]]:
+    """
+    Compute the total uphill and downhill elevation with an explicit
+    peak/valley threshold, instead of smoothing.
+
+    A candidate peak (or valley) is only *confirmed* once the elevation
+    reverses from it by at least ``min_elevation_change`` **and** at least
+    ``min_horizontal_distance`` of horizontal travel has been accumulated
+    since the last confirmed extreme (i.e. the peak-to-valley distance).
+    Only confirmed peaks/valleys contribute to the result, so noise smaller
+    than the thresholds is ignored regardless of the sampling frequency.
+
+    The final, not-yet-confirmed change at the end of a run *is* counted,
+    but only if it satisfies both thresholds (the end of the data acts as
+    a boundary, there is no reversal left to confirm it).
+
+    A ``None`` elevation is *not* filtered out: it breaks the run, exactly
+    like a segment boundary. Points before and after the gap are never
+    joined into a single climb/descent.
+
+    Parameters
+    ----------
+    elevations: list
+        List of elevations, None where elevation is missing (a gap).
+    horizontal_distances: list
+        horizontal_distances[i] is the horizontal (2d) distance between
+        points i-1 and i. The first element is ignored. Duplicate
+        positions contribute 0 and therefore cannot satisfy
+        ``min_horizontal_distance``.
+    min_elevation_change: float
+        Minimum vertical change (in meters) needed to confirm a peak/valley.
+    min_horizontal_distance: float
+        Minimum horizontal distance (in meters) between two consecutive
+        confirmed extremes (peak-to-valley distance).
+
+    Returns
+    ----------
+    uphill_downhill_extremes: tuple
+        Tuple of (uphill, downhill, extremes) where extremes are the
+        indices (into ``elevations``) of the confirmed peaks/valleys
+        actually used for the statistics, in order.
+    """
+    if len(elevations) != len(horizontal_distances):
+        raise ValueError('elevations and horizontal_distances must have the same length')
+
+    uphill, downhill = 0., 0.
+    extremes: List[int] = []
+
+    # State of the current run (reset on None elevations):
+    start_index: Optional[int] = None  # last confirmed extreme, first point of the run
+    extreme_index: Optional[int] = None  # current candidate peak/valley
+    distance_since_start = 0.  # horizontal travel since the last confirmed extreme
+    distance_since_extreme = 0.  # horizontal travel since the candidate extreme
+
+    def __close_run() -> None:
+        # Count the trailing, not-yet-confirmed change if it reaches the thresholds:
+        nonlocal uphill, downhill
+        if start_index is None or extreme_index is None or start_index == extreme_index:
+            return
+        start_ele = elevations[start_index]
+        extreme_ele = elevations[extreme_index]
+        if start_ele is None or extreme_ele is None:
+            return
+        delta = extreme_ele - start_ele
+        if abs(delta) >= min_elevation_change and distance_since_start >= min_horizontal_distance:
+            if delta > 0:
+                uphill += delta
+            else:
+                downhill -= delta
+            extremes.append(extreme_index)
+
+    for index, elevation in enumerate(elevations):
+        if elevation is None:
+            # Missing elevation breaks the run (like a segment boundary):
+            __close_run()
+            start_index = extreme_index = None
+            distance_since_start = 0.
+            distance_since_extreme = 0.
+            continue
+        if start_index is None or extreme_index is None:
+            start_index = extreme_index = index
+            distance_since_start = 0.
+            distance_since_extreme = 0.
+            extremes.append(index)
+            continue
+        distance_since_start += horizontal_distances[index]
+        distance_since_extreme += horizontal_distances[index]
+        start_ele = elevations[start_index]
+        extreme_ele = elevations[extreme_index]
+        if start_ele is None or extreme_ele is None:
+            continue  # Cannot happen: run start/extreme always have elevations
+        climbing = extreme_ele >= start_ele
+        if (climbing and elevation >= extreme_ele) or (not climbing and elevation <= extreme_ele):
+            # Elevation still moving in the run direction: move the candidate extreme:
+            extreme_index = index
+            distance_since_extreme = 0.
+        else:
+            # Reversal from the candidate extreme: confirm it once both
+            # thresholds are reached:
+            if abs(extreme_ele - elevation) >= min_elevation_change \
+                    and distance_since_start >= min_horizontal_distance:
+                __close_run()
+                # Start a new run from the confirmed extreme; the current
+                # point is the first candidate of the opposite run:
+                start_index = extreme_index
+                extreme_index = index
+                distance_since_start = distance_since_extreme
+                distance_since_extreme = 0.
+    __close_run()
+
+    return uphill, downhill, extremes
+
+
 def distance(latitude_1: float, longitude_1: float, elevation_1: Optional[float],
             latitude_2: float, longitude_2: float, elevation_2: Optional[float],
             haversine: bool=False) -> float:

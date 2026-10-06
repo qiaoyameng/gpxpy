@@ -3706,5 +3706,104 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
 
+    def __threshold_gpx(self, elevations: List[Optional[float]], lat_step: float=0.) -> mod_gpx.GPX:
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        gpx.tracks[0].segments.append(mod_gpx.GPXTrackSegment())
+        for i, elevation in enumerate(elevations):
+            gpx.tracks[0].segments[0].points.append(
+                    mod_gpx.GPXTrackPoint(latitude=i * lat_step, longitude=0, elevation=elevation))
+        return gpx
+
+    def test_uphill_downhill_threshold_flat_noise(self) -> None:
+        # Flat ride with +-1m elevation noise: nothing reaches the 2m
+        # threshold, so no climb is reported:
+        gpx = self.__threshold_gpx([100, 101, 100, 101, 100, 101, 100])
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(min_elevation_change=2)
+        self.assertEqual(0, uphill)
+        self.assertEqual(0, downhill)
+        self.assertEqual([100], [point.elevation for point in extremes])
+
+    def test_uphill_downhill_threshold_single_climb_small_fallback(self) -> None:
+        # Single 30m climb followed by a 3m fallback: the fallback does not
+        # reach the 10m threshold, so the peak is never confirmed by a
+        # reversal, but the trailing (not-yet-confirmed) 30m climb still
+        # satisfies the thresholds and is counted:
+        gpx = self.__threshold_gpx([100, 110, 120, 130, 127])
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(min_elevation_change=10)
+        self.assertEqual(30, uphill)
+        self.assertEqual(0, downhill)
+        self.assertEqual([100, 130], [point.elevation for point in extremes])
+
+    def test_uphill_downhill_threshold_confirmed_reversal(self) -> None:
+        # 30m climb, then a 15m descent which confirms the 130 peak:
+        gpx = self.__threshold_gpx([100, 110, 120, 130, 115])
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(min_elevation_change=10)
+        self.assertEqual(30, uphill)
+        self.assertEqual(15, downhill)
+        self.assertEqual([100, 130, 115], [point.elevation for point in extremes])
+
+    def test_uphill_downhill_threshold_missing_elevation_breaks_run(self) -> None:
+        # The None elevation must break the run: 100->120 is a 20m climb,
+        # 90->80 a separate 10m descent. If the gap were filtered out and
+        # the points joined, 120->80 would be a 40m descent instead:
+        gpx = self.__threshold_gpx([100, 110, 120, None, 90, 80])
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(min_elevation_change=10)
+        self.assertEqual(20, uphill)
+        self.assertEqual(10, downhill)
+        self.assertEqual([100, 120, 90, 80], [point.elevation for point in extremes])
+
+    def test_uphill_downhill_threshold_segment_break_not_joined(self) -> None:
+        # Same as the missing-elevation case, but with a segment boundary:
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        for elevations in ([100, 110, 120], [90, 80]):
+            segment = mod_gpx.GPXTrackSegment()
+            for elevation in elevations:
+                segment.points.append(mod_gpx.GPXTrackPoint(latitude=0, longitude=0, elevation=elevation))
+            gpx.tracks[0].segments.append(segment)
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(min_elevation_change=10)
+        self.assertEqual(20, uphill)
+        self.assertEqual(10, downhill)
+        self.assertEqual([100, 120, 90, 80], [point.elevation for point in extremes])
+
+    def test_uphill_downhill_threshold_sampling_density(self) -> None:
+        # The same flat ride with +-1m noise, sampled 4x denser: the
+        # cumulative climb must not grow with the sampling density:
+        sparse = self.__threshold_gpx([100, 101] * 4)
+        dense = self.__threshold_gpx([100, 101] * 16)
+        sparse_uphill, sparse_downhill, _ = sparse.get_uphill_downhill_threshold(min_elevation_change=2)
+        dense_uphill, dense_downhill, _ = dense.get_uphill_downhill_threshold(min_elevation_change=2)
+        self.assertEqual(0, sparse_uphill)
+        self.assertEqual(0, sparse_downhill)
+        self.assertEqual(sparse_uphill, dense_uphill)
+        self.assertEqual(sparse_downhill, dense_downhill)
+
+    def test_uphill_downhill_threshold_horizontal_distance(self) -> None:
+        # 0.0001 degrees latitude ~= 11.13m, so consecutive extremes are
+        # ~22.26m apart and satisfy the 10m horizontal threshold:
+        gpx = self.__threshold_gpx([0, 20, 0], lat_step=0.0001)
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(
+                min_elevation_change=10, min_horizontal_distance=10)
+        self.assertEqual(20, uphill)
+        self.assertEqual(20, downhill)
+        self.assertEqual([0, 20, 0], [point.elevation for point in extremes])
+
+    def test_uphill_downhill_threshold_duplicate_positions(self) -> None:
+        # Duplicate positions contribute 0 horizontal distance and can
+        # therefore never satisfy the horizontal distance threshold:
+        gpx = self.__threshold_gpx([0, 20, 0], lat_step=0)
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(
+                min_elevation_change=10, min_horizontal_distance=10)
+        self.assertEqual(0, uphill)
+        self.assertEqual(0, downhill)
+
+    def test_uphill_downhill_threshold_empty(self) -> None:
+        gpx = mod_gpx.GPX()
+        uphill, downhill, extremes = gpx.get_uphill_downhill_threshold(min_elevation_change=10)
+        self.assertEqual(0, uphill)
+        self.assertEqual(0, downhill)
+        self.assertEqual([], extremes)
+
 if __name__ == '__main__':
     mod_unittest.main()

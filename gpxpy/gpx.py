@@ -124,6 +124,10 @@ class MovingData(NamedTuple):
 class UphillDownhill(NamedTuple):
     uphill: float
     downhill: float
+class ThresholdUphillDownhill(NamedTuple):
+    uphill: float
+    downhill: float
+    extremes: List["GPXTrackPoint"]
 class MinimumMaximum(NamedTuple):
     minimum: Optional[float]
     maximum: Optional[float]
@@ -1167,6 +1171,61 @@ class GPXTrackSegment:
 
         return UphillDownhill(uphill, downhill)
 
+    def get_uphill_downhill_threshold(self, min_elevation_change: float,
+                                      min_horizontal_distance: float=0.) -> ThresholdUphillDownhill:
+        """
+        Calculates the uphill and downhill elevation climbs for the track
+        segment with an explicit peak/valley threshold instead of smoothing.
+        More stable than get_uphill_downhill() for noisy elevation data and
+        independent of the sampling frequency.
+
+        A candidate peak (or valley) is only confirmed once the elevation
+        reverses from it by at least min_elevation_change and at least
+        min_horizontal_distance of horizontal travel has been accumulated
+        since the last confirmed extreme (the peak-to-valley distance).
+        The final, not-yet-confirmed change at the end of the segment is
+        counted only if it satisfies both thresholds.
+
+        Points without elevation are not filtered out: they break the
+        segment exactly like a segment boundary, so elevations before and
+        after a gap are never joined into a single climb/descent. Duplicate
+        positions contribute 0 to the accumulated horizontal distance and
+        can therefore not satisfy min_horizontal_distance.
+
+        Parameters
+        ----------
+        min_elevation_change: float
+            Minimum vertical change (in meters) needed to confirm a
+            peak/valley.
+        min_horizontal_distance: float
+            Minimum horizontal distance (in meters) between two consecutive
+            confirmed extremes (the peak-to-valley distance).
+
+        Returns
+        -------
+        uphill_downhill: ThresholdUphillDownhill named tuple
+            uphill: float
+                Uphill elevation climbs in meters
+            downhill: float
+                Downhill elevation descent in meters
+            extremes: list
+                The confirmed peak/valley track points actually used for
+                the statistics, in track order.
+        """
+        if not self.points:
+            return ThresholdUphillDownhill(0, 0, [])
+
+        elevations = [point.elevation for point in self.points]
+        distances: List[float] = [0.]
+        for previous_point, point in zip(self.points, self.points[1:]):
+            distances.append(previous_point.distance_2d(point) or 0.)
+
+        uphill, downhill, extreme_indices = mod_geo.calculate_uphill_downhill_threshold(
+                elevations, distances, min_elevation_change, min_horizontal_distance)
+
+        extremes = [self.points[index] for index in extreme_indices]
+        return ThresholdUphillDownhill(uphill, downhill, extremes)
+
     def get_elevation_extremes(self) -> MinimumMaximum:
         """
         Calculate elevation extremes of track segment
@@ -1799,6 +1858,42 @@ class GPXTrack:
 
         return UphillDownhill(uphill, downhill)
 
+    def get_uphill_downhill_threshold(self, min_elevation_change: float,
+                                      min_horizontal_distance: float=0.) -> ThresholdUphillDownhill:
+        """
+        Calculates the uphill and downhill elevation climbs for the track
+        with an explicit peak/valley threshold instead of smoothing.
+        See GPXTrackSegment.get_uphill_downhill_threshold(...) for details.
+        Segment boundaries are never joined into a single climb/descent.
+
+        Returns
+        -------
+        uphill_downhill: ThresholdUphillDownhill named tuple
+            uphill: float
+                Uphill elevation climbs in meters
+            downhill: float
+                Downhill elevation descent in meters
+            extremes: list
+                The confirmed peak/valley track points actually used for
+                the statistics, in track order.
+        """
+        if not self.segments:
+            return ThresholdUphillDownhill(0, 0, [])
+
+        uphill: float = 0
+        downhill: float = 0
+        extremes: List[GPXTrackPoint] = []
+
+        for track_segment in self.segments:
+            current_uphill, current_downhill, current_extremes = \
+                    track_segment.get_uphill_downhill_threshold(min_elevation_change, min_horizontal_distance)
+
+            uphill += current_uphill or .0
+            downhill += current_downhill or .0
+            extremes.extend(current_extremes)
+
+        return ThresholdUphillDownhill(uphill, downhill, extremes)
+
     def get_location_at(self, time: mod_datetime.datetime) -> List[GPXTrackPoint]:
         """
         Gets approx. location at given time. Note that, at the moment this
@@ -2385,6 +2480,41 @@ class GPX:
             downhill += current_downhill or 0
 
         return UphillDownhill(uphill, downhill)
+
+    def get_uphill_downhill_threshold(self, min_elevation_change: float,
+                                      min_horizontal_distance: float=0.) -> ThresholdUphillDownhill:
+        """
+        Calculates the uphill and downhill elevation climbs for the gpx
+        file with an explicit peak/valley threshold instead of smoothing.
+        See GPXTrackSegment.get_uphill_downhill_threshold(...) for details.
+
+        Returns
+        -------
+        uphill_downhill: ThresholdUphillDownhill named tuple
+            uphill: float
+                Uphill elevation climbs in meters
+            downhill: float
+                Downhill elevation descent in meters
+            extremes: list
+                The confirmed peak/valley track points actually used for
+                the statistics, in track order.
+        """
+        if not self.tracks:
+            return ThresholdUphillDownhill(0, 0, [])
+
+        uphill: float = 0
+        downhill: float = 0
+        extremes: List[GPXTrackPoint] = []
+
+        for track in self.tracks:
+            current_uphill, current_downhill, current_extremes = \
+                    track.get_uphill_downhill_threshold(min_elevation_change, min_horizontal_distance)
+
+            uphill += current_uphill or 0
+            downhill += current_downhill or 0
+            extremes.extend(current_extremes)
+
+        return ThresholdUphillDownhill(uphill, downhill, extremes)
 
     def get_location_at(self, time: mod_datetime.datetime) -> List[mod_geo.Location]:
         """
