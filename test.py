@@ -40,6 +40,7 @@ except ImportError:
 
 import gpxpy as mod_gpxpy
 import gpxpy.gpx as mod_gpx
+import gpxpy.stitch as mod_stitch
 import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
@@ -3706,5 +3707,127 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
 
+    def __make_stitch_segment(self, points: List[Tuple[float, float, Any]]) -> mod_gpx.GPXTrackSegment:
+        return mod_gpx.GPXTrackSegment(points=[
+                mod_gpx.GPXTrackPoint(latitude=latitude, longitude=longitude, time=time)
+                for latitude, longitude, time in points])
+
+    def __at(self, seconds: float) -> mod_datetime.datetime:
+        return mod_datetime.datetime(2020, 1, 1) + mod_datetime.timedelta(seconds=seconds)
+
+    def test_stitch_segments_optimal_not_greedy(self) -> None:
+        # Four segments whose near endpoints sit at ~0, 4.4, 5.6 and 10
+        # meters along the equator. A closest-first greedy strategy joins
+        # the 1.1m pair (segments 1 and 2) and is then stuck with the 10m
+        # pair (segments 0 and 3): total ~11.1m. The optimum joins
+        # 0->1 and 2->3 instead: two times ~4.4m, total ~8.9m.
+        segment_a = self.__make_stitch_segment([(0, 0.01, self.__at(0)), (0, 0.0, self.__at(10))])
+        segment_b = self.__make_stitch_segment([(0, 0.00004, self.__at(20)), (0, 0.02, self.__at(30))])
+        segment_c = self.__make_stitch_segment([(0, 0.03, self.__at(5)), (0, 0.00005, self.__at(15))])
+        segment_d = self.__make_stitch_segment([(0, 0.00009, self.__at(40)), (0, 0.04, self.__at(50))])
+
+        segments = [segment_a, segment_b, segment_c, segment_d]
+        result = mod_stitch.stitch_segments(segments, max_join_distance=12.0,
+                                            time_tolerance=mod_datetime.timedelta(seconds=5))
+
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(2, result.joins_no)
+        chains = sorted(track.segment_indices for track in result.tracks)
+        self.assertEqual([[0, 1], [2, 3]], chains)
+        for track in result.tracks:
+            self.assertEqual([False, False], track.reversed_flags)
+        # The greedy solution would cost ~11.1m; the optimum is ~8.9m:
+        self.assertLess(result.total_join_distance, 10.0)
+        self.assertAlmostEqual(8.9, result.total_join_distance, delta=0.2)
+        # Every input segment is accounted for exactly once:
+        accounted = sorted(index for track in result.tracks for index in track.segment_indices)
+        self.assertEqual([0, 1, 2, 3], accounted)
+        self.assertEqual([], result.excluded)
+
+    def test_stitch_segments_time_regression_vetoes_close_endpoints(self) -> None:
+        # Endpoints are 0.1m apart, but the time clearly goes backwards:
+        # no connection may be created, regardless of distance.
+        segment_a = self.__make_stitch_segment([(0, 0.01, self.__at(100)), (0, 0.0, self.__at(200))])
+        segment_b = self.__make_stitch_segment([(0, 0.000001, self.__at(0)), (0, 0.02, self.__at(50))])
+
+        result = mod_stitch.stitch_segments([segment_a, segment_b], max_join_distance=5.0,
+                                            time_tolerance=mod_datetime.timedelta(seconds=10))
+
+        self.assertEqual(0, result.joins_no)
+        chains = sorted(track.segment_indices for track in result.tracks)
+        self.assertEqual([[0], [1]], chains)
+
+        # With the times in a consistent order the same geometry joins:
+        segment_c = self.__make_stitch_segment([(0, 0.01, self.__at(0)), (0, 0.0, self.__at(100))])
+        segment_d = self.__make_stitch_segment([(0, 0.000001, self.__at(200)), (0, 0.02, self.__at(300))])
+        result = mod_stitch.stitch_segments([segment_c, segment_d], max_join_distance=5.0)
+        self.assertEqual(1, result.joins_no)
+
+    def test_stitch_segments_reverses_untimed_without_mutating(self) -> None:
+        segment_a = self.__make_stitch_segment([(0, 0.01, None), (0, 0.0, None)])
+        segment_b = self.__make_stitch_segment([(0, 0.02, None), (0, 0.000005, None)])
+
+        result = mod_stitch.stitch_segments([segment_a, segment_b], max_join_distance=5.0)
+
+        self.assertEqual(1, len(result.tracks))
+        track = result.tracks[0]
+        self.assertEqual([0, 1], track.segment_indices)
+        self.assertEqual([False, True], track.reversed_flags)
+        # The user objects were not reversed in place:
+        self.assertEqual(0.02, segment_b.points[0].longitude)
+        self.assertEqual(0.000005, segment_b.points[1].longitude)
+        # materialize() returns a new segment in travel order:
+        merged = track.materialize([segment_a, segment_b])
+        self.assertEqual([0.01, 0.0, 0.000005, 0.02],
+                         [point.longitude for point in merged.points])
+        self.assertEqual(0.02, segment_b.points[0].longitude)
+
+    def test_stitch_segments_timed_reversal_only_when_allowed(self) -> None:
+        # Same geometry as the untimed reversal test, but both segments
+        # carry timestamps, so reversal is forbidden by default.
+        segment_a = self.__make_stitch_segment([(0, 0.01, self.__at(0)), (0, 0.0, self.__at(10))])
+        segment_b = self.__make_stitch_segment([(0, 0.02, self.__at(20)), (0, 0.000005, self.__at(30))])
+
+        result = mod_stitch.stitch_segments([segment_a, segment_b], max_join_distance=5.0)
+        self.assertEqual(0, result.joins_no)
+
+        result = mod_stitch.stitch_segments([segment_a, segment_b], max_join_distance=5.0,
+                                            allow_timed_reversal=True)
+        self.assertEqual(1, result.joins_no)
+        self.assertEqual([False, True], result.tracks[0].reversed_flags)
+
+    def test_stitch_segments_ambiguity_is_stable(self) -> None:
+        # Four untimed endpoints on the corners of a ~1.1m square: two
+        # perfect matchings have exactly the same cost.
+        segment_a = self.__make_stitch_segment([(0.01, 0.01, None), (0, 0, None)])
+        segment_b = self.__make_stitch_segment([(0, 0.00001, None), (0.01, 0.02, None)])
+        segment_c = self.__make_stitch_segment([(0.02, 0.01, None), (0.00001, 0, None)])
+        segment_d = self.__make_stitch_segment([(0.00001, 0.00001, None), (0.02, 0.02, None)])
+        segments = [segment_a, segment_b, segment_c, segment_d]
+
+        result = mod_stitch.stitch_segments(segments, max_join_distance=1.3)
+
+        self.assertTrue(result.ambiguous)
+        self.assertEqual(1, len(result.alternatives))
+        self.assertEqual(2, result.joins_no)
+        # Deterministic reporting: running again gives the same primary
+        # solution and the same alternatives:
+        again = mod_stitch.stitch_segments(segments, max_join_distance=1.3)
+        self.assertEqual(result.describe(), again.describe())
+
+    def test_stitch_segments_empty_segment_excluded(self) -> None:
+        segment_a = self.__make_stitch_segment([(0, 0.01, self.__at(0)), (0, 0.0, self.__at(10))])
+        empty = mod_gpx.GPXTrackSegment()
+        segment_b = self.__make_stitch_segment([(0, 0.000005, self.__at(20)), (0, 0.02, self.__at(30))])
+
+        result = mod_stitch.stitch_segments([segment_a, empty, segment_b], max_join_distance=5.0)
+
+        self.assertEqual(1, len(result.excluded))
+        self.assertEqual(1, result.excluded[0].index)
+        self.assertTrue(result.excluded[0].reason)
+        # Every non-excluded segment appears in exactly one track:
+        accounted = sorted(index for track in result.tracks for index in track.segment_indices)
+        self.assertEqual([0, 2], accounted)
+        self.assertEqual(1, result.joins_no)
 if __name__ == '__main__':
     mod_unittest.main()
