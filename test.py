@@ -1128,6 +1128,107 @@ class GPXTests(mod_unittest.TestCase):
         self.assertEqual(stopped_distance, moving_data.stopped_distance)
         self.assertEqual(max_speed, moving_data.max_speed)
 
+    def stop_point(self, offset: float, time: mod_datetime.datetime) -> mod_gpx.GPXTrackPoint:
+        return mod_gpx.GPXTrackPoint(offset / mod_geo.ONE_DEGREE, offset / mod_geo.ONE_DEGREE, time=time)
+
+    def test_get_stops_dense_and_sparse_results_are_consistent(self) -> None:
+        start_time = mod_datetime.datetime(2024, 1, 1)
+        dense_offsets = [0.] * 21
+        sparse_indexes = [0, 4, 8, 12, 16, 20]
+        sparse_offsets = [20., -20., -20., 20., 20., -20.]
+        for index, offset in zip(sparse_indexes, sparse_offsets):
+            dense_offsets[index] = offset
+        for index in set(range(21)) - set(sparse_indexes):
+            dense_offsets[index] = 5. if index % 2 else -5.
+
+        dense_segment = mod_gpx.GPXTrackSegment([
+            self.stop_point(offset, start_time + mod_datetime.timedelta(seconds=30 * index))
+            for index, offset in enumerate(dense_offsets)
+        ])
+        sparse_segment = mod_gpx.GPXTrackSegment([
+            self.stop_point(dense_offsets[index], start_time + mod_datetime.timedelta(seconds=120 * sample_no))
+            for sample_no, index in enumerate(sparse_indexes)
+        ])
+
+        dense_stops = dense_segment.get_stops(radius=30, minimum_duration=600, maximum_observation_gap=120)
+        sparse_stops = sparse_segment.get_stops(radius=30, minimum_duration=600, maximum_observation_gap=120)
+
+        self.assertEqual(len(dense_stops), 1)
+        self.assertEqual(len(sparse_stops), 1)
+        self.assertIs(dense_stops[0].start_point, dense_segment.points[0])
+        self.assertIs(dense_stops[0].end_point, dense_segment.points[-1])
+        self.assertIs(sparse_stops[0].start_point, sparse_segment.points[0])
+        self.assertIs(sparse_stops[0].end_point, sparse_segment.points[-1])
+        self.assertEqual(dense_stops[0].start_time, sparse_stops[0].start_time)
+        self.assertEqual(dense_stops[0].end_time, sparse_stops[0].end_time)
+        self.assertEqual(dense_stops[0].point_start_no, 0)
+        self.assertEqual(dense_stops[0].point_end_no, 20)
+        self.assertEqual(sparse_stops[0].point_start_no, 0)
+        self.assertEqual(sparse_stops[0].point_end_no, 5)
+        self.assertEqual(dense_stops[0].center.latitude, sparse_stops[0].center.latitude)
+        self.assertEqual(dense_stops[0].center.longitude, sparse_stops[0].center.longitude)
+        for point in dense_segment.points:
+            self.assertLessEqual(point.distance_2d(dense_stops[0].center), 30)
+
+    def test_get_stops_rejects_slow_walk_outside_radius(self) -> None:
+        start_time = mod_datetime.datetime(2024, 1, 1)
+        segment = mod_gpx.GPXTrackSegment([
+            self.stop_point(10 * index, start_time + mod_datetime.timedelta(seconds=60 * index))
+            for index in range(21)
+        ])
+
+        stops = segment.get_stops(radius=30, minimum_duration=600, maximum_observation_gap=120)
+
+        self.assertEqual(stops, [])
+
+    def test_get_stops_respect_gaps_invalid_points_and_segments(self) -> None:
+        start_time = mod_datetime.datetime(2024, 1, 1)
+
+        dense_segment = mod_gpx.GPXTrackSegment([
+            self.stop_point(20 if index % 2 else -20, start_time + mod_datetime.timedelta(seconds=60 * index))
+            for index in range(6)
+        ])
+        dense_segment.points.append(self.stop_point(20, start_time + mod_datetime.timedelta(seconds=900)))
+        for index in range(6):
+            dense_segment.points.append(
+                self.stop_point(20 if index % 2 else -20, start_time + mod_datetime.timedelta(seconds=960 + 60 * index)))
+
+        dense_stops = dense_segment.get_stops(radius=30, minimum_duration=300, maximum_observation_gap=300)
+        self.assertEqual(len(dense_stops), 2)
+
+        interrupted_segment = mod_gpx.GPXTrackSegment()
+        for index in range(6):
+            interrupted_segment.points.append(
+                self.stop_point(20 if index % 2 else -20, start_time + mod_datetime.timedelta(seconds=60 * index)))
+        interrupted_segment.points.append(mod_gpx.GPXTrackPoint(0, 0))
+        for index in range(6):
+            interrupted_segment.points.append(
+                self.stop_point(20 if index % 2 else -20, start_time + mod_datetime.timedelta(seconds=360 + 60 * index)))
+        missing_location = self.stop_point(0, start_time + mod_datetime.timedelta(seconds=690))
+        setattr(missing_location, 'latitude', None)
+        setattr(missing_location, 'longitude', None)
+        interrupted_segment.points.append(missing_location)
+        for index in range(6):
+            interrupted_segment.points.append(
+                self.stop_point(20 if index % 2 else -20, start_time + mod_datetime.timedelta(seconds=720 + 60 * index)))
+
+        separate_segment = mod_gpx.GPXTrackSegment([
+            self.stop_point(20 if index % 2 else -20, start_time + mod_datetime.timedelta(seconds=60 * index))
+            for index in range(6)
+        ])
+        track = mod_gpx.GPXTrack()
+        track.segments = [interrupted_segment, separate_segment]
+
+        track_stops = track.get_stops(radius=30, minimum_duration=300, maximum_observation_gap=120)
+        self.assertEqual([(stop.segment_no, stop.point_start_no, stop.point_end_no) for stop in track_stops],
+                         [(0, 0, 5), (0, 7, 12), (0, 14, 19), (1, 0, 5)])
+
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(track)
+        gpx_stops = gpx.get_stops(radius=30, minimum_duration=300, maximum_observation_gap=120)
+        self.assertEqual([(stop.track_no, stop.segment_no) for stop in gpx_stops],
+                         [(0, 0), (0, 0), (0, 0), (0, 1)])
+
     def test_named_tuples_values_uphill_downhill(self) -> None:
         gpx = self.parse('korita-zbevnica.gpx')
 

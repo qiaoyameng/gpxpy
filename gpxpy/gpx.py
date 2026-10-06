@@ -139,6 +139,151 @@ class PointData(NamedTuple):
     segment_no: int
     point_no: int
 
+class StopData(NamedTuple):
+    start_point: "GPXTrackPoint"
+    end_point: "GPXTrackPoint"
+    start_time: mod_datetime.datetime
+    end_time: mod_datetime.datetime
+    center: mod_geo.Location
+    track_no: int
+    segment_no: int
+    point_start_no: int
+    point_end_no: int
+
+
+ProjectedPoint = Tuple[float, float]
+ObservedPoint = Tuple[int, "GPXTrackPoint", float, float]
+
+
+def _minimum_enclosing_circle(points: List[ProjectedPoint]) -> Tuple[float, float, float]:
+    ordered_points = list(points)
+    if not ordered_points:
+        raise ValueError('points must not be empty')
+
+    def contains(circle: Tuple[float, float, float], point: ProjectedPoint) -> bool:
+        return mod_math.hypot(point[0] - circle[0], point[1] - circle[1]) <= circle[2] + 1e-9
+
+    def diameter_circle(first: ProjectedPoint, second: ProjectedPoint) -> Tuple[float, float, float]:
+        center_x = (first[0] + second[0]) / 2
+        center_y = (first[1] + second[1]) / 2
+        radius = mod_math.hypot(first[0] - center_x, first[1] - center_y)
+        return center_x, center_y, radius
+
+    def circumcircle(first: ProjectedPoint, second: ProjectedPoint, third: ProjectedPoint) -> Tuple[float, float, float]:
+        determinant = 2 * (
+            first[0] * (second[1] - third[1])
+            + second[0] * (third[1] - first[1])
+            + third[0] * (first[1] - second[1])
+        )
+        if abs(determinant) < 1e-12:
+            return max((
+                diameter_circle(first, second),
+                diameter_circle(first, third),
+                diameter_circle(second, third),
+            ), key=lambda candidate: candidate[2])
+
+        first_radius_squared = first[0] ** 2 + first[1] ** 2
+        second_radius_squared = second[0] ** 2 + second[1] ** 2
+        third_radius_squared = third[0] ** 2 + third[1] ** 2
+        center_x = (
+            first_radius_squared * (second[1] - third[1])
+            + second_radius_squared * (third[1] - first[1])
+            + third_radius_squared * (first[1] - second[1])
+        ) / determinant
+        center_y = (
+            first_radius_squared * (third[0] - second[0])
+            + second_radius_squared * (first[0] - third[0])
+            + third_radius_squared * (second[0] - first[0])
+        ) / determinant
+        radius = mod_math.hypot(first[0] - center_x, first[1] - center_y)
+        return center_x, center_y, radius
+
+    first_x, first_y = ordered_points[0]
+    circle = first_x, first_y, 0.
+    for point_no in range(1, len(ordered_points)):
+        point = ordered_points[point_no]
+        if contains(circle, point):
+            continue
+        circle = point[0], point[1], 0.
+        for previous_no in range(point_no):
+            previous = ordered_points[previous_no]
+            if contains(circle, previous):
+                continue
+            circle = diameter_circle(point, previous)
+            for earlier_no in range(previous_no):
+                earlier = ordered_points[earlier_no]
+                if not contains(circle, earlier):
+                    circle = circumcircle(point, previous, earlier)
+
+    return circle
+
+
+def _project_track_point(point: "GPXTrackPoint", reference_latitude: float,
+                         reference_longitude: float) -> ProjectedPoint:
+    x = (
+        (point.longitude - reference_longitude)
+        * mod_math.cos(mod_math.radians(reference_latitude))
+        * mod_geo.ONE_DEGREE
+    )
+    y = (point.latitude - reference_latitude) * mod_geo.ONE_DEGREE
+    return x, y
+
+
+def _unproject_track_point(projected_point: ProjectedPoint, reference_latitude: float,
+                           reference_longitude: float) -> mod_geo.Location:
+    cos_reference_latitude = mod_math.cos(mod_math.radians(reference_latitude))
+    longitude = reference_longitude
+    if cos_reference_latitude:
+        longitude += projected_point[0] / (mod_geo.ONE_DEGREE * cos_reference_latitude)
+    return mod_geo.Location(
+        reference_latitude + projected_point[1] / mod_geo.ONE_DEGREE,
+        longitude,
+    )
+
+
+def _append_stop_evidence(evidence: List[ObservedPoint], reference_latitude: float, reference_longitude: float,
+                          radius: float, minimum_duration: float, stops: List[StopData]) -> None:
+    left = 0
+
+    def emit(stop_left: int, stop_right: int) -> bool:
+        if stop_right - stop_left < 1:
+            return False
+        candidate = evidence[stop_left:stop_right + 1]
+        start_index, start_point, _, _ = candidate[0]
+        end_index, end_point, _, _ = candidate[-1]
+        if start_point.time is None or end_point.time is None:
+            return False
+        duration = mod_utils.total_seconds(end_point.time - start_point.time)
+        if duration is None:
+            return False
+        if duration < minimum_duration:
+            return False
+
+        projected = [(x, y) for _, _, x, y in candidate]
+        center_x, center_y, _ = _minimum_enclosing_circle(projected)
+        stops.append(StopData(
+            start_point,
+            end_point,
+            start_point.time,
+            end_point.time,
+            _unproject_track_point((center_x, center_y), reference_latitude, reference_longitude),
+            -1,
+            -1,
+            start_index,
+            end_index,
+        ))
+        return True
+
+    for right in range(len(evidence)):
+        while _minimum_enclosing_circle([(x, y) for _, _, x, y in evidence[left:right + 1]])[2] > radius:
+            if emit(left, right - 1):
+                left = right
+                break
+            left += 1
+
+    if left < len(evidence):
+        emit(left, len(evidence) - 1)
+
 
 class GPXException(Exception):
     """
@@ -698,6 +843,67 @@ class GPXTrackSegment:
     def __init__(self, points: Optional[List[GPXTrackPoint]]=None) -> None:
         self.points: List[GPXTrackPoint] = points if points else []
         self.extensions: List[Any] = []
+
+    def get_stops(self, radius: float, minimum_duration: float, maximum_observation_gap: float) -> List[StopData]:
+        """
+        Find maximal stopped intervals in this track segment.
+
+        A stop contains consecutive, timestamped, located observations whose
+        smallest enclosing circle is no larger than ``radius`` meters. The
+        representative center is that circle's center. Coordinates are
+        projected with a local equirectangular projection.
+
+        The first-to-last timestamp must be at least ``minimum_duration``
+        seconds. Consecutive observations may be at most
+        ``maximum_observation_gap`` seconds apart. A larger gap, a negative
+        time difference, a point without time, or a point without latitude or
+        longitude closes the current evidence and starts a new one. Such
+        points are not interpolated or included in a stop. Segment boundaries
+        are also hard boundaries; stops never span multiple segments.
+
+        Unlike testing only consecutive points, the radius test is applied to
+        every point in the complete interval, so a slow drift can be rejected.
+        """
+        if radius <= 0:
+            raise ValueError('radius must be positive')
+        if minimum_duration <= 0:
+            raise ValueError('minimum_duration must be positive')
+        if maximum_observation_gap <= 0:
+            raise ValueError('maximum_observation_gap must be positive')
+
+        stops: List[StopData] = []
+        observations: List[ObservedPoint] = []
+        reference_latitude = 0.
+        reference_longitude = 0.
+
+        for point_no, point in enumerate(self.points):
+            if point.time is None or point.latitude is None or point.longitude is None:
+                if observations:
+                    _append_stop_evidence(
+                        observations, reference_latitude, reference_longitude, radius, minimum_duration, stops)
+                    observations = []
+                continue
+
+            if observations:
+                previous_point = observations[-1][1]
+                if previous_point.time is not None:
+                    gap = mod_utils.total_seconds(point.time - previous_point.time)
+                    if gap is None or gap < 0 or gap > maximum_observation_gap:
+                        _append_stop_evidence(
+                            observations, reference_latitude, reference_longitude, radius, minimum_duration, stops)
+                        observations = []
+
+            if not observations:
+                reference_latitude = point.latitude
+                reference_longitude = point.longitude
+            projected_x, projected_y = _project_track_point(point, reference_latitude, reference_longitude)
+            observations.append((point_no, point, projected_x, projected_y))
+
+        if observations:
+            _append_stop_evidence(
+                observations, reference_latitude, reference_longitude, radius, minimum_duration, stops)
+
+        return stops
 
     def simplify(self, max_distance: Optional[float]=None) -> None:
         """
@@ -1719,6 +1925,19 @@ class GPXTrack:
 
         return MovingData(moving_time, stopped_time, moving_distance, stopped_distance, max_speed)
 
+    def get_stops(self, radius: float, minimum_duration: float, maximum_observation_gap: float) -> List[StopData]:
+        """
+        Find stops in every segment of this track.
+
+        See GPXTrackSegment.get_stops for detection and boundary rules. Stops
+        never span two segments.
+        """
+        stops: List[StopData] = []
+        for segment_no, segment in enumerate(self.segments):
+            for stop in segment.get_stops(radius, minimum_duration, maximum_observation_gap):
+                stops.append(stop._replace(track_no=-1, segment_no=segment_no))
+        return stops
+
     def add_elevation(self, delta: float) -> None:
         """
         Adjusts elevation data for track.
@@ -2242,6 +2461,19 @@ class GPX:
                 max_speed = track_max_speed
 
         return MovingData(moving_time, stopped_time, moving_distance, stopped_distance, max_speed)
+
+    def get_stops(self, radius: float, minimum_duration: float, maximum_observation_gap: float) -> List[StopData]:
+        """
+        Find stops in every track and segment of this GPX file.
+
+        See GPXTrackSegment.get_stops for detection and boundary rules. Stops
+        never span tracks or segments.
+        """
+        stops: List[StopData] = []
+        for track_no, track in enumerate(self.tracks):
+            for stop in track.get_stops(radius, minimum_duration, maximum_observation_gap):
+                stops.append(stop._replace(track_no=track_no))
+        return stops
 
     def split(self, track_no: int, track_segment_no: int, track_point_no: int) -> None:
         """
