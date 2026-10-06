@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added `simplify_replay()` on `GPX`, `GPXTrack` and `GPXTrackSegment`: time-aware simplification which keeps the minimal number of points such that every removed point is within `max_error` meters of its time-interpolated position. Preserves stops and speed changes on straight stretches, keeps caller-given anchor points, never interpolates across missing timestamps or backwards time jumps, and raises `gpxpy.geo.ReplaySimplificationError` when the exact result exceeds the operations budget.
+
 ## v1.6.1
 
 - Minor fix

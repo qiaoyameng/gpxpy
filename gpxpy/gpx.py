@@ -705,6 +705,37 @@ class GPXTrackSegment:
         """
         self.points = mod_geo.simplify_polyline(self.points, max_distance) # type: ignore
 
+    def simplify_replay(self, max_error: float, anchors: Optional[Iterable['GPXTrackPoint']]=None,
+                        max_operations: Optional[int]=None) -> None:
+        """
+        Simplify the segment for faithful time-based replay: the kept points,
+        linearly interpolated over time, reproduce every removed point within
+        max_error meters. Unlike simplify() (Ramer-Douglas-Peucker), this
+        preserves stops, braking and accelerations on straight stretches.
+
+        The number of kept points is minimized exactly. The first and last
+        points, the given anchors and points without a timestamp are always
+        kept. Points are never interpolated across missing timestamps or
+        backwards time jumps. Kept points are the original point objects, so
+        their extensions and other fields stay attached.
+
+        Parameters
+        ----------
+        max_error : float
+            The maximum allowed spatial error in meters between an original
+            point and its time-interpolated position
+        anchors : iterable of GPXTrackPoint, optional
+            Points that must be kept
+        max_operations : int, optional
+            Budget of point-error evaluations. If the exact minimum cannot be
+            computed within the budget, gpxpy.geo.ReplaySimplificationError
+            is raised instead of silently returning an approximate result.
+            Defaults to gpxpy.geo.DEFAULT_REPLAY_MAX_OPERATIONS.
+        """
+        anchor_ids = set(id(point) for point in anchors) if anchors else set()
+        anchor_indices = set(index for index, point in enumerate(self.points) if id(point) in anchor_ids)
+        self.points = mod_geo.simplify_replay(self.points, max_error, anchor_indices, max_operations)
+
     def reduce_points(self, min_distance: float) -> None:
         """
         Reduces the number of points in the track segment. Segment points will
@@ -1436,6 +1467,18 @@ class GPXTrack:
         for segment in self.segments:
             segment.simplify(max_distance=max_distance)
 
+    def simplify_replay(self, max_error: float, anchors: Optional[Iterable['GPXTrackPoint']]=None,
+                        max_operations: Optional[int]=None) -> None:
+        """
+        Simplify every segment for faithful time-based replay. See
+        GPXTrackSegment.simplify_replay() for details. Segments are
+        simplified independently: points are never interpolated across
+        segment boundaries. max_operations applies per segment.
+        """
+        anchor_list = list(anchors) if anchors is not None else None
+        for segment in self.segments:
+            segment.simplify_replay(max_error=max_error, anchors=anchor_list, max_operations=max_operations)
+
     def reduce_points(self, min_distance: float) -> None:
         """
         Reduces the number of points in the track. Segment points will be
@@ -2018,6 +2061,18 @@ class GPX:
         """
         for track in self.tracks:
             track.simplify(max_distance=max_distance)
+
+    def simplify_replay(self, max_error: float, anchors: Optional[Iterable['GPXTrackPoint']]=None,
+                        max_operations: Optional[int]=None) -> None:
+        """
+        Simplify every track for faithful time-based replay. See
+        GPXTrackSegment.simplify_replay() for details. Segments are
+        simplified independently: points are never interpolated across
+        segment boundaries. max_operations applies per segment.
+        """
+        anchor_list = list(anchors) if anchors is not None else None
+        for track in self.tracks:
+            track.simplify_replay(max_error=max_error, anchors=anchor_list, max_operations=max_operations)
 
     def reduce_points(self, max_points_no: Optional[float]=None, min_distance: Optional[float]=None) -> None:
         """

@@ -152,6 +152,81 @@ def print_etree(e1: Any, indent: str='') -> str:
     return ''.join(tag)
 
 
+def make_replay_points(speeds: List[float], dt: float=1.0,
+                       elevations: Optional[List[Optional[float]]]=None) -> List[mod_gpx.GPXTrackPoint]:
+    """ Straight (due-north) track with piecewise-constant speeds in m/s. """
+    points = []
+    time = mod_datetime.datetime(2020, 1, 1, 12, 0, 0)
+    travelled = 0.
+    for i, speed in enumerate(speeds):
+        elevation = elevations[i] if elevations else None
+        points.append(mod_gpx.GPXTrackPoint(latitude=45. + travelled / mod_geo.ONE_DEGREE,
+                                            longitude=14., elevation=elevation, time=time))
+        travelled += speed * dt
+        time += mod_datetime.timedelta(seconds=dt)
+    return points
+
+
+def replay_result_indices(original: List[mod_gpx.GPXTrackPoint],
+                          result: List[mod_gpx.GPXTrackPoint]) -> List[int]:
+    """ Indices of the result points in the original point list (identity-based). """
+    original_ids = dict((id(point), index) for index, point in enumerate(original))
+    return [original_ids[id(point)] for point in result]
+
+
+def replay_reference_chord_ok(points: List[mod_gpx.GPXTrackPoint], max_error: float,
+                              start: int, end: int) -> bool:
+    """ True if every point between start and end is within max_error of the
+    time-interpolated chord start->end. Independent reference implementation. """
+    start_time = points[start].time
+    end_time = points[end].time
+    if start_time is None or end_time is None or end_time <= start_time:
+        return False
+    for k in range(start + 1, end):
+        point = points[k]
+        if point.time is None:
+            return False
+        ratio = (point.time - start_time).total_seconds() / (end_time - start_time).total_seconds()
+        latitude = points[start].latitude + ratio * (points[end].latitude - points[start].latitude)
+        longitude = points[start].longitude + ratio * (points[end].longitude - points[start].longitude)
+        elevation = None
+        if points[start].elevation is not None and points[end].elevation is not None:
+            elevation = points[start].elevation + ratio * (points[end].elevation - points[start].elevation)
+        if mod_geo.distance(latitude, longitude, elevation,
+                            point.latitude, point.longitude, point.elevation) > max_error:
+            return False
+    return True
+
+
+def replay_reference_min_kept(points: List[mod_gpx.GPXTrackPoint], max_error: float,
+                              anchor_indices: AbstractSet[int]=frozenset()) -> Optional[List[int]]:
+    """ Exhaustive search over all point subsets for the minimal feasible kept
+    set. Independent reference implementation used to check simplify_replay. """
+    n = len(points)
+    best = None
+    for mask in range(1 << n):
+        kept = [i for i in range(n) if mask & (1 << i)]
+        if not kept or kept[0] != 0 or kept[-1] != n - 1 or not anchor_indices.issubset(kept):
+            continue
+        kept_set = set(kept)
+        feasible = True
+        # Points without a timestamp cannot be interpolated => must be kept:
+        for i, point in enumerate(points):
+            if point.time is None and i not in kept_set:
+                feasible = False
+        for a, b in zip(kept, kept[1:]):
+            # Chords never cross missing timestamps or backwards time jumps:
+            for k in range(a, b):
+                time_a, time_b = points[k].time, points[k + 1].time
+                if time_a is None or time_b is None or time_b < time_a:
+                    feasible = False
+            if not replay_reference_chord_ok(points, max_error, a, b):
+                feasible = False
+        if feasible and (best is None or len(kept) < len(best)):
+            best = kept
+    return best
+
+
 class GPXTests(mod_unittest.TestCase):
     """
     Add tests here.
@@ -1807,6 +1882,147 @@ class GPXTests(mod_unittest.TestCase):
         gpx.tracks[0].segments[0].points.append(gpx.tracks[0].segments[0].points[0])
 
         gpx.simplify()
+
+    def test_simplify_replay_straight_line_constant_speed(self) -> None:
+        points = make_replay_points([10.] * 10)
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        # Constant speed on a straight line => only first and last point needed:
+        self.assertEqual([0, 9], replay_result_indices(points, segment.points))
+
+    def test_simplify_replay_straight_line_speed_changes(self) -> None:
+        # Perfectly straight shape, but with a stop in the middle:
+        speeds = [10., 10., 10., 0., 0., 10., 10., 10.]
+
+        # Ramer-Douglas-Peucker only sees the straight shape and deletes the stop:
+        rdp_segment = mod_gpx.GPXTrackSegment(points=make_replay_points(speeds))
+        rdp_segment.simplify(max_distance=1.)
+        self.assertEqual(2, len(rdp_segment.points))
+
+        # Replay simplification keeps the points needed to reproduce the stop:
+        points = make_replay_points(speeds)
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        self.assertEqual([0, 3, 5, 7], replay_result_indices(points, segment.points))
+
+    def test_simplify_replay_anchors(self) -> None:
+        points = make_replay_points([10.] * 9)
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1., anchors=[points[4]])
+        self.assertEqual([0, 4, 8], replay_result_indices(points, segment.points))
+
+    def test_simplify_replay_missing_time(self) -> None:
+        points = make_replay_points([10.] * 9)
+        points[4].time = None
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        # The point without a timestamp is kept and never interpolated across:
+        self.assertEqual([0, 3, 4, 5, 8], replay_result_indices(points, segment.points))
+
+    def test_simplify_replay_time_regression(self) -> None:
+        points = make_replay_points([10.] * 8)
+        # Times 0,1,2,3,2,3,4,5: a backwards jump between points 3 and 4, but
+        # constant speed before and after it:
+        for i, point in enumerate(points):
+            point.time = mod_datetime.datetime(2020, 1, 1, 12, 0, 0) + \
+                mod_datetime.timedelta(seconds=i if i < 4 else i - 2)
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        # Both sides of the backwards time jump are kept:
+        self.assertEqual([0, 3, 4, 7], replay_result_indices(points, segment.points))
+
+    def test_simplify_replay_equal_times_keeps_everything(self) -> None:
+        points = make_replay_points([10.] * 6)
+        for point in points:
+            point.time = mod_datetime.datetime(2020, 1, 1)
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        # No two distinct timestamps => no interpolation possible:
+        self.assertEqual(6, len(segment.points))
+
+    def test_simplify_replay_elevation_spike(self) -> None:
+        elevations: List[Optional[float]] = [100.] * 9
+        elevations[4] = 200.
+        points = make_replay_points([10.] * 9, elevations=elevations)
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        self.assertTrue(4 in replay_result_indices(points, segment.points))
+
+    def test_simplify_replay_max_operations_exceeded(self) -> None:
+        points = make_replay_points([10., 10., 10., 0., 0., 10., 10., 10.])
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        # Explicit refusal instead of silently returning an approximate result:
+        self.assertRaises(mod_geo.ReplaySimplificationError,
+                          segment.simplify_replay, 0.001, None, 0)
+        # Without a budget limit the same segment simplifies fine:
+        segment.simplify_replay(max_error=0.001)
+        self.assertTrue(len(segment.points) < len(points))
+
+    def test_simplify_replay_preserves_point_identity(self) -> None:
+        points = make_replay_points([10., 10., 0., 0., 10., 10.])
+        for i, point in enumerate(points):
+            point.name = f'point-{i}'
+            point.extensions.append(f'extension-{i}')
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        self.assertTrue(len(segment.points) < len(points))
+        for point in segment.points:
+            index = int((point.name or '').split('-')[1])
+            # Kept points are the original objects, extensions stay attached:
+            self.assertTrue(point is points[index])
+            self.assertEqual([f'extension-{index}'], point.extensions)
+
+    def test_simplify_replay_track_and_gpx_level(self) -> None:
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        gpx.tracks[0].segments.append(mod_gpx.GPXTrackSegment(points=make_replay_points([10.] * 6)))
+        gpx.tracks[0].segments.append(mod_gpx.GPXTrackSegment(points=make_replay_points([10.] * 6)))
+        gpx.simplify_replay(max_error=1.)
+        # Each segment keeps its own first/last point (no cross-segment compression):
+        self.assertEqual(2, len(gpx.tracks[0].segments[0].points))
+        self.assertEqual(2, len(gpx.tracks[0].segments[1].points))
+
+    def test_simplify_replay_short_segment(self) -> None:
+        points = make_replay_points([10., 10.])
+        segment = mod_gpx.GPXTrackSegment(points=list(points))
+        segment.simplify_replay(max_error=1.)
+        self.assertEqual(2, len(segment.points))
+
+    def test_simplify_replay_against_exhaustive_search(self) -> None:
+        random = mod_random.Random(42)
+        for sample in range(30):
+            n = random.randint(3, 9)
+            speeds = [random.choice([0., 2., 5., 10., 15.]) for _ in range(n)]
+            max_error = random.choice([0.1, 0.5, 1., 2., 5.])
+            points = make_replay_points(speeds)
+            # Half of the samples get a slightly curved shape:
+            if sample % 2:
+                for point in points[1:-1]:
+                    point.longitude += random.uniform(-1, 1) / mod_geo.ONE_DEGREE
+            # Some samples have (partially missing) elevations:
+            if sample % 3 == 2:
+                for point in points:
+                    point.elevation = random.choice([None, 100., 105.])
+            anchor_indices = set(random.sample(range(1, n - 1), random.randint(0, min(2, n - 2))))
+            anchors = [points[i] for i in sorted(anchor_indices)]
+
+            reference = replay_reference_min_kept(points, max_error, anchor_indices)
+            if reference is None:
+                self.fail('Exhaustive reference search found no feasible subset')
+
+            segment = mod_gpx.GPXTrackSegment(points=list(points))
+            segment.simplify_replay(max_error=max_error, anchors=anchors)
+            kept = replay_result_indices(points, segment.points)
+
+            # Same (minimal) number of kept points as the exhaustive reference:
+            self.assertEqual(len(reference), len(kept))
+            # ... and the result itself is feasible:
+            self.assertEqual(0, kept[0])
+            self.assertEqual(n - 1, kept[-1])
+            for anchor_index in anchor_indices:
+                self.assertTrue(anchor_index in kept)
+            for a, b in zip(kept, kept[1:]):
+                self.assertTrue(replay_reference_chord_ok(points, max_error, a, b))
 
     def test_nan_elevation(self) -> None:
         xml = '<?xml version="1.0" encoding="UTF-8"?><gpx> <wpt lat="12" lon="13"> <ele>nan</ele></wpt> <rte> <rtept lat="12" lon="13"> <ele>nan</ele></rtept></rte> <trk> <name/> <desc/> <trkseg> <trkpt lat="12" lon="13"> <ele>nan</ele></trkpt></trkseg></trk></gpx>'

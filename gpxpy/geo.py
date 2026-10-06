@@ -14,6 +14,7 @@
 
 import logging as mod_logging
 import math as mod_math
+import datetime as mod_datetime
 
 from typing import *
 
@@ -357,6 +358,148 @@ def simplify_polyline(points: List["Location"], max_distance: Optional[float]) -
     # function again using (begin to anchor) and (anchor to end), remove extra anchor
     return (simplify_polyline(points[:tmp_max_distance_position + 1], _max_distance) +
             simplify_polyline(points[tmp_max_distance_position:], _max_distance)[1:])
+
+
+class ReplaySimplificationError(Exception):
+    """
+    Raised when replay (time-aware) simplification cannot compute the exact
+    minimal result within the allowed number of operations.
+    """
+
+
+DEFAULT_REPLAY_MAX_OPERATIONS = 10 ** 7
+"""
+Default budget of point-error evaluations for one simplify_replay() call.
+"""
+
+
+class TimeAwareLocation(Protocol):
+    """ Structural type for locations carrying a timestamp (e.g. GPXTrackPoint). """
+    latitude: float
+    longitude: float
+    elevation: Optional[float]
+    time: Optional[mod_datetime.datetime]
+
+
+TLocation = TypeVar('TLocation', bound=TimeAwareLocation)
+
+
+def simplify_replay(points: List[TLocation], max_error: float,
+                    anchor_indices: Optional[AbstractSet[int]]=None,
+                    max_operations: Optional[int]=None) -> List[TLocation]:
+    """
+    Time-aware (replay) simplification of a polyline.
+
+    Returns the minimal subset of the given points such that, when the kept
+    points are linearly interpolated over time, every removed point lies
+    within ``max_error`` meters of its interpolated position. Unlike
+    simplify_polyline() (Ramer-Douglas-Peucker), this preserves stops,
+    braking and accelerations on straight stretches.
+
+    The first and last points, the points with indices in ``anchor_indices``
+    and points without a timestamp are always kept. Points are never
+    interpolated across missing timestamps or backwards time jumps.
+
+    The result contains the original point objects (identity preserved).
+
+    If the exact minimum cannot be computed within ``max_operations``
+    point-error evaluations (default DEFAULT_REPLAY_MAX_OPERATIONS),
+    ReplaySimplificationError is raised instead of returning an approximate
+    result.
+    """
+    n = len(points)
+    if n < 3:
+        return list(points)
+
+    anchors = set(anchor_indices) if anchor_indices else set()
+    operations_limit = DEFAULT_REPLAY_MAX_OPERATIONS if max_operations is None else max_operations
+    operations = 0
+
+    def chord_error(run_points: List[TLocation], run_times: List[mod_datetime.datetime],
+                    start: int, end: int, k: int) -> float:
+        """ Spatial error of point k w.r.t. the time-interpolated chord start->end. """
+        start_point = run_points[start]
+        end_point = run_points[end]
+        point = run_points[k]
+        ratio = (run_times[k] - run_times[start]).total_seconds() / \
+                (run_times[end] - run_times[start]).total_seconds()
+        latitude = start_point.latitude + ratio * (end_point.latitude - start_point.latitude)
+        longitude = start_point.longitude + ratio * (end_point.longitude - start_point.longitude)
+        elevation = None
+        if start_point.elevation is not None and end_point.elevation is not None:
+            elevation = start_point.elevation + ratio * (end_point.elevation - start_point.elevation)
+        return distance(latitude, longitude, elevation, point.latitude, point.longitude, point.elevation)
+
+    def chord_valid(run_points: List[TLocation], run_times: List[mod_datetime.datetime],
+                    start: int, end: int) -> bool:
+        nonlocal operations
+        for k in range(start + 1, end):
+            operations += 1
+            if operations > operations_limit:
+                raise ReplaySimplificationError(
+                    f'Replay simplification needs more than {operations_limit} operations; '
+                    'refusing to return an approximate result')
+            if chord_error(run_points, run_times, start, end, k) > max_error:
+                return False
+        return True
+
+    def simplify_interval(run_points: List[TLocation], run_times: List[mod_datetime.datetime],
+                          start: int, end: int) -> Set[int]:
+        """ Minimal kept indices (relative to run_points) between start and end, both kept. """
+        best_count: Dict[int, int] = {start: 1}
+        predecessor: Dict[int, int] = {}
+        for i in range(start + 1, end + 1):
+            for j in range(start, i):
+                if j not in best_count or run_times[j] >= run_times[i]:
+                    continue
+                if chord_valid(run_points, run_times, j, i):
+                    count = best_count[j] + 1
+                    if i not in best_count or count < best_count[i]:
+                        best_count[i] = count
+                        predecessor[i] = j
+        if end not in best_count:
+            # No valid simplification (e.g. all timestamps equal): keep everything
+            return set(range(start, end + 1))
+        result = set()
+        i = end
+        while True:
+            result.add(i)
+            if i == start:
+                return result
+            i = predecessor[i]
+
+    # Split into runs of points with present, non-decreasing timestamps.
+    # Missing timestamps and backwards time jumps are never interpolated across.
+    runs: List[Tuple[int, int]] = []
+    run_start = 0
+    for i in range(1, n):
+        previous_time = points[i - 1].time
+        current_time = points[i].time
+        if previous_time is None or current_time is None or current_time < previous_time:
+            runs.append((run_start, i - 1))
+            run_start = i
+    runs.append((run_start, n - 1))
+
+    kept: Set[int] = set()
+    for run_start, run_end in runs:
+        if run_end - run_start < 2:
+            kept.update(range(run_start, run_end + 1))
+            continue
+        run_points = points[run_start:run_end + 1]
+        run_times: List[mod_datetime.datetime] = []
+        for point in run_points:
+            time = point.time
+            assert time is not None  # guaranteed by the run detection above
+            run_times.append(time)
+        # Anchors must be kept, so every interval between two consecutive
+        # required points can be minimized independently:
+        required = sorted({0, len(run_points) - 1} |
+                          {index - run_start for index in anchors if run_start <= index <= run_end})
+        for interval_start, interval_end in zip(required, required[1:]):
+            kept.update(run_start + index
+                        for index in simplify_interval(run_points, run_times, interval_start, interval_end))
+
+    return [points[i] for i in sorted(kept)]
 
 
 class Location:
