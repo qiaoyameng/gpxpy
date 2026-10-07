@@ -15,6 +15,13 @@
 from typing import IO, AnyStr
 
 from . import gpx as mod_gpx
+from .converter import (
+    ConversionItem,
+    ConversionItemKind,
+    ConversionReport,
+    GPXVersionConversionException,
+    convert_version,
+)
 
 __version__ = '1.6.2'
 

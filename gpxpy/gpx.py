@@ -72,6 +72,7 @@ GPX_10_POINT_FIELDS = [
         mod_gpxfield.GPXField('position_dilution', 'pdop', type=mod_gpxfield.FLOAT_TYPE),
         mod_gpxfield.GPXField('age_of_dgps_data', 'ageofdgpsdata', type=mod_gpxfield.FLOAT_TYPE),
         mod_gpxfield.GPXField('dgps_id', 'dgpsid', type=mod_gpxfield.INT_TYPE),
+        mod_gpxfield.GPXExtensionsField('extensions', direct_gpx_10_nodes=True),
 ]
 GPX_11_POINT_FIELDS = [
         # See GPX for description of text fields
@@ -352,6 +353,7 @@ class GPXRoute:
             mod_gpxfield.GPXField('link', 'url'),
             mod_gpxfield.GPXField('link_text', 'urlname'),
             mod_gpxfield.GPXField('number', type=mod_gpxfield.INT_TYPE),
+            mod_gpxfield.GPXExtensionsField('extensions', direct_gpx_10_nodes=True),
             mod_gpxfield.GPXComplexField('points', tag='rtept', classs=GPXRoutePoint, is_list=True),
     ]
     gpx_11_fields = [
@@ -687,6 +689,7 @@ class GPXTrackPoint(mod_geo.Location):
 class GPXTrackSegment:
     gpx_10_fields = [
             mod_gpxfield.GPXComplexField('points', tag='trkpt', classs=GPXTrackPoint, is_list=True),
+            mod_gpxfield.GPXExtensionsField('extensions', direct_gpx_10_nodes=True),
     ]
     gpx_11_fields = [
             mod_gpxfield.GPXComplexField('points', tag='trkpt', classs=GPXTrackPoint, is_list=True),
@@ -1393,6 +1396,7 @@ class GPXTrack:
             mod_gpxfield.GPXField('link', 'url'),
             mod_gpxfield.GPXField('link_text', 'urlname'),
             mod_gpxfield.GPXField('number', type=mod_gpxfield.INT_TYPE),
+            mod_gpxfield.GPXExtensionsField('extensions', direct_gpx_10_nodes=True),
             mod_gpxfield.GPXComplexField('segments', tag='trkseg', classs=GPXTrackSegment, is_list=True),
     ]
     gpx_11_fields = [
@@ -1933,6 +1937,7 @@ class GPX:
             mod_gpxfield.GPXComplexField('waypoints', classs=GPXWaypoint, tag='wpt', is_list=True),
             mod_gpxfield.GPXComplexField('routes', classs=GPXRoute, tag='rte', is_list=True),
             mod_gpxfield.GPXComplexField('tracks', classs=GPXTrack, tag='trk', is_list=True),
+            mod_gpxfield.GPXExtensionsField('extensions', direct_gpx_10_nodes=True),
     ]
     # Text fields serialize as empty container tags, dependents are
     # are listed after as 'tag:dep1:dep2:dep3'. If no dependents are
@@ -2011,6 +2016,17 @@ class GPX:
         self.tracks: List[GPXTrack] = []
         self.nsmap: Dict[str, str] = {}
         self.schema_locations: List[str] = []
+
+    def convert_version(self, target_version: str, *, strict: bool=False,
+                        extension_namespace: str = 'https://gpxpy.org/conversion/1.0',
+                        extension_prefix: str = 'gpx10') -> Tuple["GPX", Any]:
+        """ Convert this GPX to another version without modifying the source object. """
+        from . import converter as mod_converter
+
+        return mod_converter.convert_version(
+            self, target_version, strict=strict,
+            extension_namespace=extension_namespace,
+            extension_prefix=extension_prefix)
 
     def simplify(self, max_distance: Optional[float]=None) -> None:
         """
@@ -2670,7 +2686,7 @@ class GPX:
         for track in self.tracks:
             track.move(location_delta)
 
-    def to_xml(self, version: Optional[str]=None, prettyprint: bool=True) -> str:
+    def to_xml(self, version: Optional[str]=None, prettyprint: bool=True, allow_extensions: bool=False) -> str:
         """
         FIXME: Note, this method will change self.version
         """
@@ -2699,16 +2715,68 @@ class GPX:
                 f'http://www.topografix.com/GPX/{version_path}/gpx.xsd',
             ]
 
+        self._register_extension_namespaces()
+
         content = mod_gpxfield.gpx_fields_to_xml(
             self, 'gpx', version,
             custom_attributes={
                 'xsi:schemaLocation': ' '.join(self.schema_locations)
             },
             nsmap=self.nsmap,
-            prettyprint=prettyprint
+            prettyprint=prettyprint,
+            allow_extensions=allow_extensions
         )
 
         return f'<?xml version="1.0" encoding="UTF-8"?>\n{content.strip()}'
+
+
+    def _register_extension_namespaces(self) -> None:
+        for extension in self._iter_extension_elements():
+            self._register_element_namespace(extension.tag)
+            for attrib in extension.attrib:
+                self._register_element_namespace(attrib)
+
+    def _register_element_namespace(self, qname: str) -> None:
+        if '}' not in qname:
+            return
+        namespace, _, _ = qname[1:].partition('}')
+        if namespace in self.nsmap.values():
+            return
+        prefix = None
+        index = 1
+        while prefix is None or prefix in self.nsmap:
+            prefix = f'ns{index}'
+            index += 1
+        self.nsmap[prefix] = namespace
+
+    def _iter_extension_elements(self) -> Iterator[Any]:
+        for extension in self.extensions:
+            yield from self._iter_element_tree(extension)
+        for extension in self.metadata_extensions:
+            yield from self._iter_element_tree(extension)
+        for waypoint in self.waypoints:
+            for extension in waypoint.extensions:
+                yield from self._iter_element_tree(extension)
+        for route in self.routes:
+            for extension in route.extensions:
+                yield from self._iter_element_tree(extension)
+            for point in route.points:
+                for extension in point.extensions:
+                    yield from self._iter_element_tree(extension)
+        for track in self.tracks:
+            for extension in track.extensions:
+                yield from self._iter_element_tree(extension)
+            for segment in track.segments:
+                for extension in segment.extensions:
+                    yield from self._iter_element_tree(extension)
+                for point in segment.points:
+                    for extension in point.extensions:
+                        yield from self._iter_element_tree(extension)
+
+    def _iter_element_tree(self, element: Any) -> Iterator[Any]:
+        yield element
+        for child in element:
+            yield from self._iter_element_tree(child)
 
     def has_times(self) -> bool:
         """ See GPXTrackSegment.has_times() """

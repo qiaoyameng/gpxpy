@@ -1,0 +1,23 @@
+<gpx version="1.0" creator="conversion-test" xmlns="http://www.topografix.com/GPX/1/0" xmlns:u="https://unknown.example/gpx-extensions/v1">
+  <author>Alice</author>
+  <email>alice@example.com</email>
+  <url>https://example.test/map</url>
+  <urlname>Example map</urlname>
+  <trk>
+    <name>Lost speed trail</name>
+    <trkseg>
+      <trkpt lat="1.0" lon="2.0">
+        <time>2024-05-06T07:08:09Z</time>
+        <course>42.5</course>
+        <speed>9.25</speed>
+      </trkpt>
+      <trkpt lat="1.1" lon="2.1">
+        <time>2024-05-06T07:08:10Z</time>
+        <course>88.0</course>
+        <speed>10.5</speed>
+        <gpx10:speed xmlns:gpx10="https://gpxpy.org/conversion/1.0">3.5</gpx10:speed>
+      </trkpt>
+    </trkseg>
+  </trk>
+  <u:widget u:id="42">before<u:nested order="first">mid</u:nested>between<u:second order="second">end</u:second>tail</u:widget>
+</gpx>

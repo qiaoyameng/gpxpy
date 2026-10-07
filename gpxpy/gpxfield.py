@@ -208,7 +208,8 @@ class GPXField(AbstractGPXField):
 
         return result
 
-    def to_xml(self, value: Any, version: str, nsmap: Any=None, prettyprint: bool=True, indent: str='') -> Optional[str]:
+    def to_xml(self, value: Any, version: str, nsmap: Any=None, prettyprint: bool=True, indent: str='',
+               allow_extensions: bool=False) -> Optional[str]:
         if value is None:
             return ''
         if not prettyprint:
@@ -245,7 +246,8 @@ class GPXComplexField(AbstractGPXField):
                 return None
             return gpx_fields_from_xml(self.classs, field_node, version)
 
-    def to_xml(self, value: Any, version: str, nsmap: Dict[str, str]={}, prettyprint: bool=True, indent: str='') -> str:
+    def to_xml(self, value: Any, version: str, nsmap: Dict[str, str]={}, prettyprint: bool=True, indent: str='',
+               allow_extensions: bool=False) -> str:
         if not prettyprint:
             indent = ''
         if self.is_list:
@@ -254,10 +256,12 @@ class GPXComplexField(AbstractGPXField):
                 result.append(gpx_fields_to_xml(obj, self.tag, version,
                                                 nsmap=nsmap,
                                                 prettyprint=prettyprint,
-                                                indent=indent))
+                                                indent=indent,
+                                                allow_extensions=allow_extensions))
             return ''.join(result)
         else:
-            return gpx_fields_to_xml(value, self.tag, version, prettyprint=prettyprint, indent=indent, empty_body=self.empty_body)
+            return gpx_fields_to_xml(value, self.tag, version, prettyprint=prettyprint, indent=indent,
+                                         empty_body=self.empty_body, allow_extensions=allow_extensions)
 
 
 class GPXEmailField(AbstractGPXField):
@@ -288,7 +292,8 @@ class GPXEmailField(AbstractGPXField):
         email_domain = email_node.get('domain')
         return f'{email_id}@{email_domain}'
 
-    def to_xml(self, value: Any, version: str, nsmap: Optional[Dict[str, str]]=None, prettyprint: bool=True, indent: str='') -> str:
+    def to_xml(self, value: Any, version: str, nsmap: Optional[Dict[str, str]]=None, prettyprint: bool=True, indent: str='',
+               allow_extensions: bool=False) -> str:
         """
         Write email address to XML
 
@@ -319,29 +324,28 @@ class GPXEmailField(AbstractGPXField):
 
 class GPXExtensionsField(AbstractGPXField):
     """
-    GPX1.1 extensions <extensions>...</extensions> key-value type.
+    GPX1.1 extensions and namespace-qualified GPX1.0 extension nodes.
     """
-    def __init__(self, name: str, tag: Optional[str]=None, is_list: bool=True) -> None:
+    def __init__(self, name: str, tag: Optional[str]=None, is_list: bool=True,
+                 direct_gpx_10_nodes: bool=False) -> None:
         AbstractGPXField.__init__(self, is_list=is_list)
         self.name = name
         self.tag = tag or 'extensions'
+        self.direct_gpx_10_nodes = direct_gpx_10_nodes
 
     def from_xml(self, node: Any, version: str) -> Any:
-        """
-        Build a list of extension Elements.
-
-        Args:
-            node: Element at the root of the extensions
-            version: unused, only 1.1 supports extensions
-
-        Returns:
-            a list of Element objects
-        """
         result: Any = []
-        extensions_node = node.find(self.tag)
-        if extensions_node is None:
-            return result
-        for child in extensions_node:
+        if version == '1.0' and self.direct_gpx_10_nodes:
+            extension_nodes = [child for child in node if isinstance(child.tag, str) and '}' in child.tag]
+            extensions_node = node.find(self.tag)
+            if extensions_node is not None:
+                extension_nodes.extend(list(extensions_node))
+        else:
+            extensions_node = node.find(self.tag)
+            if extensions_node is None:
+                return result
+            extension_nodes = list(extensions_node)
+        for child in extension_nodes:
             result.append(mod_copy.deepcopy(child))
         return result
 
@@ -370,58 +374,46 @@ class GPXExtensionsField(AbstractGPXField):
                     break
         return qname
 
-    def _ETree_to_xml(self, node: Any, nsmap: Dict[str, str]={}, prettyprint: bool=True, indent: str='') -> str:
-        """
-        Serialize ETree element and all subelements.
-
-        Creates a string of the ETree and all children. The prefixes are
-        resolved through the nsmap for easier to read XML.
-
-        Args:
-            node: ETree with the extension data
-            version: string of GPX version, must be 1.1
-            nsmap: dict of prefixes and URIs
-            prettyprint: boolean, when true, indent line
-            indent: string prepended to tag, usually 2 spaces per level
-
-        Returns:
-            string with all the prefixed tags and data for the node
-            and its children as XML.
-
-        """
+    def _ETree_to_xml(self, node: Any, nsmap: Dict[str, str]={}, prettyprint: bool=True,
+                      indent: str='', prefix: str='') -> str:
         if not prettyprint:
             indent = ''
+            prefix = ''
 
-        # Build element tag and text
         result = []
         prefixedname = self._resolve_prefix(node.tag, nsmap)
-        result.append(f'\n{indent}<{prefixedname}')
+        result.append(f'{prefix}<{prefixedname}')
         for attrib, value in node.attrib.items():
             attrib = self._resolve_prefix(attrib, nsmap)
-            result.append(f' {attrib}="{value}"')
+            escaped_value = mod_saxutils.escape(value, {'"': '&quot;'})
+            result.append(f' {attrib}="{escaped_value}"')
         result.append('>')
         if node.text is not None:
-            result.append(mod_saxutils.escape(node.text).strip())
+            result.append(mod_saxutils.escape(node.text))
 
-        # Build subelement nodes
+        mixed_content = node.text is not None
         for child in node:
+            if mixed_content:
+                child_prefix = ''
+                child_indent = indent
+            else:
+                child_prefix = f'\n{indent}  ' if prettyprint else ''
+                child_indent = f'{indent}  ' if prettyprint else ''
             result.append(self._ETree_to_xml(child, nsmap,
                                              prettyprint=prettyprint,
-                                             indent=f'{indent}  '))
+                                             indent=child_indent,
+                                             prefix=child_prefix))
 
-        # Add tail and close tag
-        tail = node.tail
-        if tail is not None:
-            tail = mod_saxutils.escape(tail.strip())
-        else:
-            tail = ''
-        if len(node) > 0:
+        if len(node) > 0 and not mixed_content:
             result.append(f'\n{indent}')
-        result.append(f'</{prefixedname}>{tail}')
+        result.append(f'</{prefixedname}>')
+        if node.tail is not None and node.tail.strip():
+            result.append(mod_saxutils.escape(node.tail))
 
         return ''.join(result)
 
-    def to_xml(self, value: Any, version: str, nsmap: Dict[str, str]={}, prettyprint: bool=True, indent: str='') -> str:
+    def to_xml(self, value: Any, version: str, nsmap: Dict[str, str]={},
+               prettyprint: bool=True, indent: str='', allow_extensions: bool=False) -> str:
         """
         Serialize list of ETree.
 
@@ -442,14 +434,20 @@ class GPXExtensionsField(AbstractGPXField):
         """
         if not prettyprint:
             indent = ''
-        if not value or version != "1.1":
+        if not value or (version == '1.0' and not allow_extensions):
             return ''
         result = [f'\n{indent}<{self.tag}>']
+        previous_tail = ''
         for extension in value:
+            extension_prefix = '' if previous_tail else (f'\n{indent}  ' if prettyprint else '')
             result.append(self._ETree_to_xml(extension, nsmap,
                                              prettyprint=prettyprint,
-                                             indent=f'{indent}  '))
-        result.append(f'\n{indent}</{self.tag}>')
+                                             indent=f'{indent}  ',
+                                             prefix=extension_prefix))
+            previous_tail = extension.tail or ''
+        if prettyprint:
+            result.append(f'\n{indent}')
+        result.append(f'</{self.tag}>')
         return ''.join(result)
 
 # ----------------------------------------------------------------------------------------------------
@@ -484,7 +482,8 @@ def _check_dependents(gpx_object: Any, fieldname: str) -> Tuple[str, str]:
     return '', fieldname # No children
 
 def gpx_fields_to_xml(instance: Any, tag: str, version: str, custom_attributes: Dict[str, str]={},
-                      nsmap: Dict[str, str]={}, prettyprint: bool=True, indent: str='', empty_body: bool=False) -> str:
+                      nsmap: Dict[str, str]={}, prettyprint: bool=True, indent: str='', empty_body: bool=False,
+                      allow_extensions: bool=False) -> str:
     if not prettyprint:
         indent = ''
     fields = instance.gpx_10_fields
@@ -541,7 +540,8 @@ def gpx_fields_to_xml(instance: Any, tag: str, version: str, custom_attributes: 
                     tag_open = False
                 xml_value = gpx_field.to_xml(value, version, nsmap,
                                              prettyprint=prettyprint,
-                                             indent=f'{indent}  ')
+                                             indent=f'{indent}  ',
+                                             allow_extensions=allow_extensions)
                 if xml_value:
                     body.append(xml_value)
 

@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.converter as mod_converter
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3421,6 +3422,165 @@ class GPXTests(mod_unittest.TestCase):
 
         xml = gpx.to_xml('1.0')
         self.assertFalse('extension' in xml)
+
+    def test_explicit_version_conversion_roundtrip(self) -> None:
+        original = self.parse('version_conversion_10.gpx', version='1.0')
+
+        converted_11, report_11 = mod_converter.convert_version(original, '1.1')
+        self.assertEqual('1.1', converted_11.version)
+        self.assertIsNot(original, converted_11)
+
+        point_11 = converted_11.tracks[0].segments[0].points[0]
+        conflicting_point_11 = converted_11.tracks[0].segments[0].points[1]
+        self.assertIsNone(point_11.speed)
+        self.assertIsNone(point_11.course)
+        self.assertEqual('9.25', point_11.extensions[0].text)
+        self.assertEqual('42.5', point_11.extensions[1].text)
+        self.assertEqual(3, len(conflicting_point_11.extensions))
+        self.assertEqual(['3.5', '10.5'], [node.text for node in conflicting_point_11.extensions if node.tag.endswith('}speed')])
+
+        reports = {(item.path, item.field): item for item in report_11.items}
+        conflict_kinds = [item.kind for item in report_11.items
+                          if (item.path, item.field) == ('/gpx/trk[0]/trkseg[0]/trkpt[1]', 'speed')]
+        self.assertEqual(9.25, reports['/gpx/trk[0]/trkseg[0]/trkpt[0]', 'speed'].value)
+        self.assertEqual(mod_converter.ConversionItemKind.EXTENSION,
+                         reports['/gpx/trk[0]/trkseg[0]/trkpt[0]', 'speed'].kind)
+        self.assertEqual(42.5, reports['/gpx/trk[0]/trkseg[0]/trkpt[0]', 'course'].value)
+        self.assertEqual('Alice', reports['/gpx/metadata/author', 'author_name'].value)
+        self.assertEqual(mod_converter.ConversionItemKind.NATIVE,
+                         reports['/gpx/metadata/author', 'author_name'].kind)
+        self.assertIn(mod_converter.ConversionItemKind.CONFLICT, conflict_kinds)
+        self.assertIn(mod_converter.ConversionItemKind.EXTENSION, conflict_kinds)
+
+        unknown = converted_11.extensions[0]
+        self.assertEqual('{https://unknown.example/gpx-extensions/v1}widget', unknown.tag)
+        self.assertEqual('42', unknown.attrib['{https://unknown.example/gpx-extensions/v1}id'])
+        self.assertEqual('before', unknown.text)
+        nested_children = list(unknown)
+        self.assertEqual(['{https://unknown.example/gpx-extensions/v1}nested',
+                          '{https://unknown.example/gpx-extensions/v1}second'],
+                         [child.tag for child in nested_children])
+        self.assertEqual('first', nested_children[0].attrib['order'])
+        self.assertEqual('mid', nested_children[0].text)
+        self.assertEqual('between', nested_children[0].tail)
+        self.assertEqual('second', nested_children[1].attrib['order'])
+        self.assertEqual('end', nested_children[1].text)
+        self.assertEqual('tail', nested_children[1].tail)
+
+        reparsed_11 = mod_gpxpy.parse(converted_11.to_xml('1.1'))
+        self.assertEqual(2, len(reparsed_11.tracks[0].segments[0].points[0].extensions))
+        converted_10, report_10 = mod_converter.convert_version(reparsed_11, '1.0')
+        point_10 = converted_10.tracks[0].segments[0].points[0]
+        self.assertEqual(9.25, point_10.speed)
+        self.assertEqual(42.5, point_10.course)
+        self.assertEqual([], point_10.extensions)
+        self.assertEqual('Alice', converted_10.author_name)
+        self.assertEqual('alice@example.com', converted_10.author_email)
+        self.assertEqual('https://example.test/map', converted_10.link)
+        self.assertEqual('Example map', converted_10.link_text)
+        unknown_10 = converted_10.extensions[0]
+        self.assertEqual('before', unknown_10.text)
+        self.assertEqual('mid', list(unknown_10)[0].text)
+        self.assertEqual('between', list(unknown_10)[0].tail)
+        self.assertEqual('end', list(unknown_10)[1].text)
+        self.assertEqual('tail', list(unknown_10)[1].tail)
+
+        conflict_point_10 = converted_10.tracks[0].segments[0].points[1]
+        self.assertEqual(10.5, conflict_point_10.speed)
+        self.assertEqual(['3.5'], [node.text for node in conflict_point_10.extensions])
+        self.assertIn(('/gpx/trk[0]/trkseg[0]/trkpt[1]', 'speed'),
+                      {(item.path, item.field) for item in report_10.conflict_items})
+
+        reparsed_10 = mod_gpxpy.parse(converted_10.to_xml('1.0', allow_extensions=True))
+        self.assertEqual(9.25, reparsed_10.tracks[0].segments[0].points[0].speed)
+        self.assertEqual(42.5, reparsed_10.tracks[0].segments[0].points[0].course)
+        self.assertEqual('Alice', reparsed_10.author_name)
+        self.assertEqual('alice@example.com', reparsed_10.author_email)
+        self.assertEqual('https://example.test/map', reparsed_10.link)
+        self.assertEqual('Example map', reparsed_10.link_text)
+        final_unknown = reparsed_10.extensions[0]
+        self.assertEqual('{https://unknown.example/gpx-extensions/v1}widget', final_unknown.tag)
+        self.assertEqual({'{https://unknown.example/gpx-extensions/v1}id': '42'}, final_unknown.attrib)
+        self.assertEqual('before', final_unknown.text)
+        self.assertEqual('mid', list(final_unknown)[0].text)
+        self.assertEqual('between', list(final_unknown)[0].tail)
+        self.assertEqual('end', list(final_unknown)[1].text)
+        self.assertEqual('tail', list(final_unknown)[1].tail)
+
+    def test_explicit_version_conversion_reverse_roundtrip(self) -> None:
+        original = mod_gpx.GPX()
+        original.version = '1.1'
+        original.creator = 'reverse-test'
+        original.author_link = 'https://example.test/author'
+        original.author_link_text = 'Author profile'
+        original.author_link_type = 'text/html'
+        original.copyright_author = 'Alice'
+        original.copyright_year = '2024'
+        original.copyright_license = 'https://example.test/license'
+        original.link_type = 'metadata-link-type'
+        metadata_extension = mod_etree.Element('{https://unknown.example/meta}widget')
+        metadata_extension.text = 'metadata'
+        original.metadata_extensions.append(metadata_extension)
+
+        route = mod_gpx.GPXRoute(name='Route')
+        route.type = 'cycling'
+        route.link_type = 'route-link-type'
+        route_point = mod_gpx.GPXRoutePoint(1.0, 2.0)
+        route_point.link_type = 'route-point-link-type'
+        route.points.append(route_point)
+        original.routes.append(route)
+        waypoint = mod_gpx.GPXWaypoint(3.0, 4.0)
+        waypoint.link_type = 'waypoint-link-type'
+        original.waypoints.append(waypoint)
+
+        converted_10, report = mod_converter.convert_version(original, '1.0')
+        self.assertEqual('1.0', converted_10.version)
+        reports = {(item.path, item.field): item for item in report.items}
+        self.assertEqual('https://example.test/author',
+                         reports['/gpx/metadata', 'author_link'].value)
+        self.assertEqual(mod_converter.ConversionItemKind.EXTENSION,
+                         reports['/gpx/metadata', 'author_link'].kind)
+        self.assertEqual('cycling', reports['/gpx/rte[0]', 'type'].value)
+
+        reparsed_10 = mod_gpxpy.parse(converted_10.to_xml('1.0', allow_extensions=True))
+        converted_11, reverse_report = mod_converter.convert_version(reparsed_10, '1.1')
+        self.assertEqual('https://example.test/author', converted_11.author_link)
+        self.assertEqual('Author profile', converted_11.author_link_text)
+        self.assertEqual('text/html', converted_11.author_link_type)
+        self.assertEqual('Alice', converted_11.copyright_author)
+        self.assertEqual('2024', converted_11.copyright_year)
+        self.assertEqual('https://example.test/license', converted_11.copyright_license)
+        self.assertEqual('metadata-link-type', converted_11.link_type)
+        self.assertEqual('cycling', converted_11.routes[0].type)
+        self.assertEqual('route-link-type', converted_11.routes[0].link_type)
+        self.assertEqual('route-point-link-type', converted_11.routes[0].points[0].link_type)
+        self.assertEqual('waypoint-link-type', converted_11.waypoints[0].link_type)
+        self.assertEqual('{https://unknown.example/meta}widget', converted_11.metadata_extensions[0].tag)
+        self.assertEqual('metadata', converted_11.metadata_extensions[0].text)
+        reverse_fields = {(item.path, item.field) for item in reverse_report.native_items}
+        self.assertIn(('/gpx/metadata', 'author_link'), reverse_fields)
+        self.assertIn(('/gpx/rte[0]', 'type'), reverse_fields)
+
+    def test_strict_version_conversion_reports_loss(self) -> None:
+        original = self.parse('version_conversion_10.gpx', version='1.0')
+        with self.assertRaises(mod_converter.GPXVersionConversionException) as context:
+            mod_converter.convert_version(original, '1.1', strict=True)
+        report = context.exception.report
+        unsupported_fields = {(item.path, item.field) for item in report.unsupported_items}
+        self.assertIn(('/gpx/trk[0]/trkseg[0]/trkpt[0]', 'speed'), unsupported_fields)
+        self.assertIn(('/gpx/trk[0]/trkseg[0]/trkpt[0]', 'course'), unsupported_fields)
+        self.assertIn(('/gpx/trk[0]/trkseg[0]/trkpt[1]', 'speed'),
+                      {(item.path, item.field) for item in report.conflict_items})
+
+        converted_11, _ = mod_converter.convert_version(original, '1.1')
+        route = mod_gpx.GPXRoute(name='Strict route')
+        route.type = 'route-kind'
+        converted_11.routes.append(route)
+        with self.assertRaises(mod_converter.GPXVersionConversionException) as context:
+            mod_converter.convert_version(converted_11, '1.0', strict=True)
+        report = context.exception.report
+        self.assertIn('/gpx/rte[0]', {item.path for item in report.unsupported_items})
+        self.assertTrue(any(item.field == 'type' for item in report.unsupported_items))
 
     def test_extension_without_namespaces(self) -> None:
         f = open('test_files/gpx1.1_with_extensions_without_namespaces.gpx')
