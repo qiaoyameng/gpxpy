@@ -28,6 +28,9 @@ from . import gpxfield as mod_gpxfield
 
 from typing import *
 
+if TYPE_CHECKING:
+    from . import converter as mod_converter
+
 log = mod_logging.getLogger(__name__)
 
 IGNORE_TOP_SPEED_PERCENTILES = 0.05
@@ -72,6 +75,7 @@ GPX_10_POINT_FIELDS = [
         mod_gpxfield.GPXField('position_dilution', 'pdop', type=mod_gpxfield.FLOAT_TYPE),
         mod_gpxfield.GPXField('age_of_dgps_data', 'ageofdgpsdata', type=mod_gpxfield.FLOAT_TYPE),
         mod_gpxfield.GPXField('dgps_id', 'dgpsid', type=mod_gpxfield.INT_TYPE),
+        mod_gpxfield.GPXExtensionsField('extensions', is_list=True, allow_10_extensions=True),
 ]
 GPX_11_POINT_FIELDS = [
         # See GPX for description of text fields
@@ -352,6 +356,7 @@ class GPXRoute:
             mod_gpxfield.GPXField('link', 'url'),
             mod_gpxfield.GPXField('link_text', 'urlname'),
             mod_gpxfield.GPXField('number', type=mod_gpxfield.INT_TYPE),
+            mod_gpxfield.GPXExtensionsField('extensions', is_list=True, allow_10_extensions=True),
             mod_gpxfield.GPXComplexField('points', tag='rtept', classs=GPXRoutePoint, is_list=True),
     ]
     gpx_11_fields = [
@@ -687,6 +692,7 @@ class GPXTrackPoint(mod_geo.Location):
 class GPXTrackSegment:
     gpx_10_fields = [
             mod_gpxfield.GPXComplexField('points', tag='trkpt', classs=GPXTrackPoint, is_list=True),
+            mod_gpxfield.GPXExtensionsField('extensions', is_list=True, allow_10_extensions=True),
     ]
     gpx_11_fields = [
             mod_gpxfield.GPXComplexField('points', tag='trkpt', classs=GPXTrackPoint, is_list=True),
@@ -1393,6 +1399,7 @@ class GPXTrack:
             mod_gpxfield.GPXField('link', 'url'),
             mod_gpxfield.GPXField('link_text', 'urlname'),
             mod_gpxfield.GPXField('number', type=mod_gpxfield.INT_TYPE),
+            mod_gpxfield.GPXExtensionsField('extensions', is_list=True, allow_10_extensions=True),
             mod_gpxfield.GPXComplexField('segments', tag='trkseg', classs=GPXTrackSegment, is_list=True),
     ]
     gpx_11_fields = [
@@ -1930,6 +1937,7 @@ class GPX:
             mod_gpxfield.GPXField('time', type=mod_gpxfield.TIME_TYPE),
             mod_gpxfield.GPXField('keywords'),
             mod_gpxfield.GPXComplexField('bounds', classs=GPXBounds, empty_body=True),
+            mod_gpxfield.GPXExtensionsField('extensions', is_list=True, allow_10_extensions=True),
             mod_gpxfield.GPXComplexField('waypoints', classs=GPXWaypoint, tag='wpt', is_list=True),
             mod_gpxfield.GPXComplexField('routes', classs=GPXRoute, tag='rte', is_list=True),
             mod_gpxfield.GPXComplexField('tracks', classs=GPXTrack, tag='trk', is_list=True),
@@ -2670,7 +2678,8 @@ class GPX:
         for track in self.tracks:
             track.move(location_delta)
 
-    def to_xml(self, version: Optional[str]=None, prettyprint: bool=True) -> str:
+    def to_xml(self, version: Optional[str]=None, prettyprint: bool=True,
+               allow_extensions: bool=False) -> str:
         """
         FIXME: Note, this method will change self.version
         """
@@ -2705,7 +2714,8 @@ class GPX:
                 'xsi:schemaLocation': ' '.join(self.schema_locations)
             },
             nsmap=self.nsmap,
-            prettyprint=prettyprint
+            prettyprint=prettyprint,
+            allow_extensions=allow_extensions
         )
 
         return f'<?xml version="1.0" encoding="UTF-8"?>\n{content.strip()}'
@@ -2742,6 +2752,11 @@ class GPX:
 
     def clone(self) -> "GPX":
         return mod_copy.deepcopy(self)
+
+    def convert_version(self, target_version: str, mode: str='strict') -> "mod_converter.ConversionResult":
+        from . import converter as mod_converter
+
+        return mod_converter.convert_version(self, target_version, mode)
 
 # Add attributes and fill default values (lists or None) for all GPX elements:
 for var_name in dir():

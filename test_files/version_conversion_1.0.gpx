@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.0" creator="conversion-test"
+   xmlns="http://www.topografix.com/GPX/1/0"
+   xmlns:gpx10="http://www.topografix.com/GPX/1/0"
+   xmlns:x="https://example.com/gpx-conversion">
+  <author>Ada Lovelace</author>
+  <email>ada@example.com</email>
+  <url>https://example.com/route</url>
+  <urlname>Route URL</urlname>
+  <x:doc x:kind="metadata">before<x:note order="2">middle</x:note>after</x:doc>
+  <trk>
+    <url>https://example.com/track</url>
+    <urlname>Track URL</urlname>
+    <trkseg>
+      <trkpt lat="46.0" lon="15.0">
+        <time>2020-01-01T00:00:00Z</time>
+        <course>12.5</course>
+        <speed>9.0</speed>
+        <url>https://example.com/point</url>
+        <urlname>Point URL</urlname>
+        <x:q x:a="z" plain="yes">lead<x:r />tail</x:q>
+        <x:speed>8.0</x:speed>
+        <gpx10:speed>99.0</gpx10:speed>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>

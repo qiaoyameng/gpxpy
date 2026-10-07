@@ -3152,6 +3152,124 @@ class GPXTests(mod_unittest.TestCase):
             self.assertTrue(gpx.tracks[0].segments[0].points[0].dgps_id is not None)
             self.assertEqual(original_gpx.tracks[0].segments[0].points[0].dgps_id, gpx.tracks[0].segments[0].points[0].dgps_id)
 
+    def test_explicit_version_conversion_roundtrip(self) -> None:
+        with open('test_files/version_conversion_1.0.gpx') as xml_file:
+            original = mod_gpxpy.parse(xml_file)
+
+        with self.assertRaises(mod_gpxpy.GPXConversionError) as strict_context:
+            mod_gpxpy.convert_version(original, '1.1', mod_gpxpy.MODE_STRICT)
+        strict_report = strict_context.exception.result.report
+        self.assertEqual(
+            {'course', 'speed'},
+            {item.field for item in strict_report.by_status(mod_gpxpy.converter.UNABLE_TO_PRESERVE)})
+        self.assertEqual(
+            'speed',
+            strict_report.by_status(mod_gpxpy.converter.EXTENSION_CONFLICT)[0].field)
+
+        up_result = mod_gpxpy.convert_version(
+            original, '1.1', mod_gpxpy.MODE_ALLOW_EXTENSIONS)
+        up = up_result.gpx
+        up_xml = mod_etree.fromstring(up.to_xml(allow_extensions=True))
+        point = up.tracks[0].segments[0].points[0]
+
+        self.assertEqual('1.1', up.version)
+        self.assertEqual('Ada Lovelace', up.author_name)
+        self.assertEqual('ada@example.com', up.author_email)
+        self.assertEqual('https://example.com/route', up.link)
+        self.assertEqual('Route URL', up.link_text)
+        self.assertEqual('https://example.com/track', up.tracks[0].link)
+        self.assertEqual('Track URL', up.tracks[0].link_text)
+        self.assertEqual('https://example.com/point', point.link)
+        self.assertEqual('Point URL', point.link_text)
+        self.assertIsNone(point.speed)
+
+        ns = {
+            'gpx11': 'http://www.topografix.com/GPX/1/1',
+            'gpx10': 'http://www.topografix.com/GPX/1/0',
+            'x': 'https://example.com/gpx-conversion',
+        }
+        self.assertEqual(
+            'Ada Lovelace',
+            up_xml.findtext('.//gpx11:metadata/gpx11:author/gpx11:name', namespaces=ns))
+        self.assertEqual(
+            'ada',
+            up_xml.find('.//gpx11:metadata/gpx11:author/gpx11:email',
+                        namespaces=ns).get('id'))
+        self.assertEqual(
+            'https://example.com/point',
+            up_xml.find('.//gpx11:trkpt/gpx11:link', namespaces=ns).get('href'))
+
+        point_extensions = up_xml.find('.//gpx11:trkpt/gpx11:extensions', namespaces=ns)
+        self.assertIsNotNone(point_extensions)
+        extension_children = list(point_extensions)
+        self.assertEqual([
+            '{http://www.topografix.com/GPX/1/0}course',
+            '{http://www.topografix.com/GPX/1/0}speed',
+            '{https://example.com/gpx-conversion}q',
+            '{https://example.com/gpx-conversion}speed',
+            '{http://www.topografix.com/GPX/1/0}speed',
+        ], [child.tag for child in extension_children])
+        self.assertEqual('12.5', extension_children[0].text)
+        self.assertEqual('9.0', extension_children[1].text)
+        self.assertEqual(
+            'native',
+            extension_children[1].get('{http://www.topografix.com/GPX/1/0}converted-from'))
+        self.assertEqual(
+            'z',
+            extension_children[2].get('{https://example.com/gpx-conversion}a'))
+        self.assertEqual('yes', extension_children[2].get('plain'))
+        self.assertEqual('lead', extension_children[2].text.strip())
+        self.assertEqual(
+            '{https://example.com/gpx-conversion}r',
+            list(extension_children[2])[0].tag)
+        self.assertEqual('tail', list(extension_children[2])[0].tail.strip())
+
+        statuses = {(item.status, item.field) for item in up_result.report.items}
+        self.assertIn((mod_gpxpy.converter.NATIVE_MAPPED, 'author_name'), statuses)
+        self.assertIn((mod_gpxpy.converter.NATIVE_MAPPED, 'author_email'), statuses)
+        self.assertIn((mod_gpxpy.converter.NATIVE_MAPPED, 'link'), statuses)
+        self.assertIn((mod_gpxpy.converter.NATIVE_MAPPED, 'link_text'), statuses)
+        self.assertIn((mod_gpxpy.converter.MOVED_TO_EXTENSION, 'course'), statuses)
+        self.assertIn((mod_gpxpy.converter.MOVED_TO_EXTENSION, 'speed'), statuses)
+        self.assertIn((mod_gpxpy.converter.UNKNOWN_PRESERVED, 'q'), statuses)
+        self.assertIn((mod_gpxpy.converter.EXTENSION_CONFLICT, 'speed'), statuses)
+
+        down_result = mod_gpxpy.convert_version(
+            up, '1.0', mod_gpxpy.MODE_ALLOW_EXTENSIONS)
+        down = down_result.gpx
+        down_point = down.tracks[0].segments[0].points[0]
+
+        self.assertEqual('1.0', down.version)
+        self.assertEqual('Ada Lovelace', down.author_name)
+        self.assertEqual('ada@example.com', down.author_email)
+        self.assertEqual('https://example.com/route', down.link)
+        self.assertEqual('Route URL', down.link_text)
+        self.assertEqual('https://example.com/track', down.tracks[0].link)
+        self.assertEqual('Track URL', down.tracks[0].link_text)
+        self.assertEqual('https://example.com/point', down_point.link)
+        self.assertEqual('Point URL', down_point.link_text)
+        self.assertEqual(12.5, down_point.course)
+        self.assertEqual(9.0, down_point.speed)
+        self.assertEqual([
+            '{https://example.com/gpx-conversion}q',
+            '{https://example.com/gpx-conversion}speed',
+            '{http://www.topografix.com/GPX/1/0}speed',
+        ], [extension.tag for extension in down_point.extensions])
+        self.assertEqual('lead', down_point.extensions[0].text.strip())
+        self.assertEqual('tail', list(down_point.extensions[0])[0].tail.strip())
+        self.assertEqual('99.0', down_point.extensions[2].text)
+
+        down_statuses = {(item.status, item.field) for item in down_result.report.items}
+        self.assertIn((mod_gpxpy.converter.NATIVE_MAPPED, 'course'), down_statuses)
+        self.assertIn((mod_gpxpy.converter.NATIVE_MAPPED, 'speed'), down_statuses)
+        self.assertIn((mod_gpxpy.converter.UNKNOWN_PRESERVED, 'q'), down_statuses)
+        self.assertNotIn(
+            mod_gpxpy.converter.EXTENSION_CONFLICT,
+            {item.status for item in down_result.report.items})
+
+        with self.assertRaises(mod_gpxpy.GPXConversionError):
+            mod_gpxpy.convert_version(up, '1.0', mod_gpxpy.MODE_STRICT)
+
     def test_min_max(self) -> None:
         gpx = mod_gpx.GPX()
 

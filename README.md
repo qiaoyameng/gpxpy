@@ -71,11 +71,13 @@ gpx.py can parse and generate GPX 1.0 and 1.1 files. The generated file will alw
 
 Be aware that the gpxpy object model *is not 100% equivalent* with the underlying GPX XML file schema. That's because the library object model works with both GPX 1.0 and 1.1.
 
-For example, GPX 1.0 specified a `speed` attribute for every track point, but that was removed in GPX 1.1. If you parse GPX 1.0 and serialize back with `gpx.to_xml()` everything will work fine. But if you have a GPX 1.1 object, changes in the `speed` attribute will be lost after `gpx.to_xml()`. If you want to force using 1.0, you can `gpx.to_xml(version="1.0")`. Another possibility is to use `extensions` to save the speed in GPX 1.1.
+For example, GPX 1.0 specified a `speed` attribute for every track point, but that was removed in GPX 1.1. Simply calling `gpx.to_xml(version="1.1")` is not a lossless conversion. Use `gpxpy.convert_version(gpx, target_version)` for an explicit conversion; it returns a new GPX object and a report describing each `native_mapped`, `moved_to_extension`, `unknown_preserved`, `extension_conflict`, or `unable_to_preserve` value.
+
+The default mode is `gpxpy.MODE_STRICT` and raises `GPXConversionError` when data cannot be represented natively. Pass `gpxpy.MODE_ALLOW_EXTENSIONS` to preserve such fields in the source GPX namespace instead. For example, GPX 1.0 `speed` and `course` become marked `gpx10:speed` and `gpx10:course` extensions in GPX 1.1. When serializing converted GPX 1.0 data containing preserved extensions, call `gpx.to_xml(version="1.0", allow_extensions=True)`.
 
 ## GPX extensions
 
-gpx.py preserves GPX extensions. They are stored as [ElementTree](https://docs.python.org/2/library/xml.etree.elementtree.html#module-xml.etree.ElementTree) DOM objects. Extensions are part of GPX 1.1, and will be ignored when serializing a GPX object in a GPX 1.0 file.
+gpx.py preserves GPX extensions. They are stored as [ElementTree](https://docs.python.org/2/library/xml.etree.elementtree.html#module-xml.etree.ElementTree) DOM objects. Extensions are part of GPX 1.1. Ordinary serialization ignores them in GPX 1.0; explicit version conversion can retain them with `allow_extensions=True`, including attributes, mixed text, child nodes, and child-node order.
 
 ## XML parsing
 
@@ -119,4 +121,3 @@ pip install gpx-cmd-tools
 ## License
 
 GPX.py is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
-

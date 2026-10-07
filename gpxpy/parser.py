@@ -105,8 +105,17 @@ class GPXParser:
             _, _, value = schema_loc.group(0).partition('=')
             self.gpx.schema_locations = value.strip('"').split()
 
-        # Remove default namespace to simplify processing later
-        self.xml = mod_re.sub(r"""\sxmlns=(['"])[^'"]+\1""", '', self.xml, count=1)
+        # Remove default namespace to simplify processing later. Keep a
+        # temporary "defaultns" declaration because extensions may contain
+        # elements in the same namespace under a non-default prefix.
+        default_namespace = mod_re.search(r"""\sxmlns=(['"])([^'"]+)\1""", self.xml)
+        if default_namespace:
+            default_uri = default_namespace.group(2)
+            self.xml = mod_re.sub(
+                r"""<gpx([^>]*?)\sxmlns=(['"])[^'"]+\2""",
+                f'<gpx\\1 xmlns:defaultns="{default_uri}"',
+                self.xml,
+                count=1)
 
         # Build tree
         try:
